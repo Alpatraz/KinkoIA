@@ -1,108 +1,130 @@
 // app/api/faq-ai/route.ts
-import fs from "node:fs";
-import path from "node:path";
-import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
 
-export const runtime = "nodejs"; // nécessaire pour utiliser fs
+export const runtime = "edge"; // ou "nodejs", comme tu veux
 
-type FaqRequest = { q: string; lang?: string };
-type Source = { file: string };
-type FaqResponse = { answer: string; sources?: Source[] };
+const SENSEI = "Sempaï Kinko";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+function systemPrompt(shopName: string) {
+  return [
+    `Tu es ${SENSEI}, assistant de la boutique ${shopName}.`,
+    `Réponds en français par défaut. Sois clair, utile, concis.`,
+    `Si tu cites une info du site ou d'une FAQ, mentionne la source sous forme courte (ex: "Source : FAQ - Inscriptions").`,
+    `Si le contexte ne suffit pas, demande une précision ou propose un lien utile (catalogue, FAQ, contact).`,
+    `N’affiche pas de métadonnées techniques (lang, fetched_at, source_url brut, etc.).`,
+  ].join(" ");
+}
+
+type RagContext = {
+  chunks: { text: string; source?: string }[];
 };
 
-const DATA_DIR = path.join(process.cwd(), "ingested");
+async function askOpenRouter(prompt: string) {
+  const key = process.env.OPENROUTER_API_KEY;
+  if (!key) throw new Error("OPENROUTER_API_KEY manquante");
 
-let INDEX: { file: string; text: string }[] | null = null;
+  const model =
+    process.env.OPENROUTER_MODEL ??
+    "meta-llama/llama-3.1-8b-instruct:free";
 
-function loadIndex(): void {
-  if (INDEX) return;
-  INDEX = [];
-  if (!fs.existsSync(DATA_DIR)) return;
-  const files = fs.readdirSync(DATA_DIR).filter((f) => /\.(md|txt|html)$/i.test(f));
-  for (const file of files) {
-    const text = fs.readFileSync(path.join(DATA_DIR, file), "utf8");
-    INDEX.push({ file, text });
-  }
-}
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${key}`,
+      "Content-Type": "application/json",
+      // Ces 2 en-têtes sont utiles côté navigateur; côté API c’est optionnel
+      "HTTP-Referer": process.env.APP_URL || "https://kinko-ia.vercel.app",
+      "X-Title": "Kinko IA",
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.3,
+      messages: [
+        { role: "system", content: systemPrompt("Kinko") },
+        { role: "user", content: prompt },
+      ],
+    }),
+  });
 
-function bestSnippet(q: string): { snippet: string; file: string } | null {
-  loadIndex();
-  if (!INDEX || INDEX.length === 0) return null;
-
-  const query = q.toLowerCase().replace(/\s+/g, " ").trim();
-  const terms = query.split(" ").filter(Boolean);
-
-  let bestScore = 0;
-  let best: { text: string; file: string } | null = null;
-
-  for (const doc of INDEX) {
-    const lower = doc.text.toLowerCase();
-    let score = 0;
-    for (const t of terms) {
-      const m = lower.match(new RegExp(`\\b${escapeRegExp(t)}\\b`, "g"));
-      score += m ? m.length : 0;
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      best = { text: doc.text, file: doc.file };
-    }
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`OpenRouter ${res.status}: ${t}`);
   }
 
-  if (!best || bestScore === 0) return null;
-
-  // extrait autour de la première occurrence
-  const lower = best.text.toLowerCase();
-  let i = Infinity;
-  for (const t of terms) {
-    const p = lower.indexOf(t);
-    if (p !== -1 && p < i) i = p;
-  }
-  if (i === Infinity) i = 0;
-  const start = Math.max(0, i - 200);
-  const end = Math.min(best.text.length, i + 400);
-  const raw = best.text.slice(start, end).replace(/\s+/g, " ").trim();
-
-  const snippet = (start > 0 ? "… " : "") + raw + (end < best.text.length ? " …" : "");
-  return { snippet, file: best.file };
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content?.trim() || "";
 }
 
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// Petit helper pour fabriquer un prompt RAG propre
+function buildRagPrompt(question: string, ctx?: RagContext) {
+  const contextBlock = (ctx?.chunks ?? [])
+    .slice(0, 6) // limite de sécurité
+    .map((c, i) => `#${i + 1} ${c.source ? `[${c.source}] ` : ""}${c.text}`)
+    .join("\n\n");
+
+  return [
+    `Question utilisateur : ${question}`,
+    contextBlock ? `\n\nContexte fiable :\n${contextBlock}` : "",
+    `\n\nConsignes : Si le contexte ne contient pas la réponse, explique-le brièvement, puis oriente vers la FAQ ou le contact.`,
+  ].join("");
 }
 
-export async function OPTIONS() {
-  return new NextResponse(null, { status: 204, headers: corsHeaders });
+function allowCors(origin: string | null) {
+  const allow = (process.env.CORS_ALLOW_ORIGINS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+  return origin && allow.includes(origin) ? origin : "";
 }
 
-export async function POST(req: Request) {
+export async function OPTIONS(req: NextRequest) {
+  const origin = req.headers.get("origin");
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": allowCors(origin),
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Max-Age": "86400",
+    },
+  });
+}
+
+export async function POST(req: NextRequest) {
   try {
-    const { q } = (await req.json()) as FaqRequest;
+    const origin = req.headers.get("origin");
+    const { q, context } = (await req.json()) as { q: string; context?: RagContext };
+
     if (!q || typeof q !== "string") {
-      return NextResponse.json<FaqResponse>(
-        { answer: "Question vide. Peux-tu préciser ?" },
-        { headers: corsHeaders, status: 400 }
-      );
+      return new Response(JSON.stringify({ error: "Question manquante." }), {
+        status: 400,
+        headers: {
+          "Access-Control-Allow-Origin": allowCors(origin),
+          "Content-Type": "application/json",
+        },
+      });
     }
 
-    const hit = bestSnippet(q);
-    const answer =
-      hit?.snippet ??
-      "Je n’ai pas trouvé d’information correspondante dans la documentation. Essaie de reformuler ta question ou visite la page Espace Kinko.";
+    const prompt = buildRagPrompt(q, context);
+    const answer = await askOpenRouter(prompt);
 
-    const payload: FaqResponse = hit
-      ? { answer, sources: [{ file: hit.file }] }
-      : { answer };
-
-    return NextResponse.json<FaqResponse>(payload, { headers: corsHeaders });
-  } catch (err) {
-    return NextResponse.json<FaqResponse>(
-      { answer: "Oups, une erreur est survenue. Réessaie dans un instant." },
-      { headers: corsHeaders, status: 500 }
+    return new Response(JSON.stringify({ answer, who: "Sempaï Kinko" }), {
+      status: 200,
+      headers: {
+        "Access-Control-Allow-Origin": allowCors(origin),
+        "Content-Type": "application/json",
+      },
+    });
+  } catch (err: any) {
+    return new Response(
+      JSON.stringify({ error: "LLM indisponible, réessaie dans un instant." }),
+      {
+        status: 500,
+        headers: {
+          "Access-Control-Allow-Origin": allowCors(req.headers.get("origin")),
+          "Content-Type": "application/json",
+        },
+      }
     );
   }
 }
