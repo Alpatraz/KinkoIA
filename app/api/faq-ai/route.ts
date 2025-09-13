@@ -22,7 +22,6 @@ type IndexChunk = {
 };
 
 type IndexFile = {
-  // format attendu: { chunks: IndexChunk[] }
   chunks: IndexChunk[];
 };
 
@@ -69,7 +68,6 @@ async function loadIndex(): Promise<IndexFile> {
     const buf = await fs.readFile(indexPath, "utf8");
     const parsed = JSON.parse(buf) as unknown;
 
-    // Validation très légère
     if (
       parsed &&
       typeof parsed === "object" &&
@@ -82,7 +80,7 @@ async function loadIndex(): Promise<IndexFile> {
           id: String(obj.id ?? i.toString()),
           url: String(obj.url ?? ""),
           title: obj.title ? String(obj.title) : undefined,
-          text: String(obj.text ?? obj.content ?? ""),
+          text: String(obj.text ?? (obj as Record<string, unknown>).content ?? ""),
           tokens: typeof obj.tokens === "number" ? obj.tokens : undefined,
         } satisfies IndexChunk;
       });
@@ -90,7 +88,7 @@ async function loadIndex(): Promise<IndexFile> {
       return cachedIndex;
     }
   } catch {
-    // ignore, on tentera le fallback
+    // ignore ; tentative fallback dessous
   }
 
   // 2) Fallback: lire tous les .md de /ingested et créer 1 chunk par fichier
@@ -101,7 +99,6 @@ async function loadIndex(): Promise<IndexFile> {
       if (!file.toLowerCase().endsWith(".md")) continue;
       const full = path.join(ingestedDir, file);
       const content = await fs.readFile(full, "utf8");
-      // Tenter d’inférer l’URL depuis le nom du fichier
       const guessedUrl = file
         .replaceAll("_", "/")
         .replace(/\.md$/i, "")
@@ -114,7 +111,7 @@ async function loadIndex(): Promise<IndexFile> {
       });
     }
   } catch {
-    // si rien, retourner un index vide
+    // pas de .md non plus → index vide
   }
 
   cachedIndex = { chunks };
@@ -147,8 +144,7 @@ function buildIdfMap(chunks: IndexChunk[]): Map<string, number> {
   }
   const idf = new Map<string, number>();
   df.forEach((v, k) => {
-    // IDF lissé
-    idf.set(k, Math.log((1 + N) / (1 + v)) + 1);
+    idf.set(k, Math.log((1 + N) / (1 + v)) + 1); // IDF lissé
   });
   return idf;
 }
@@ -170,7 +166,7 @@ function scoreChunk(queryTokens: string[], ch: IndexChunk, idf: Map<string, numb
     score += f * w;
   }
 
-  // Léger bonus si les mots du titre matchent
+  // Bonus si le titre matche
   if (ch.title) {
     const titleTokens = new Set(tokenize(ch.title));
     let hits = 0;
@@ -184,7 +180,6 @@ function scoreChunk(queryTokens: string[], ch: IndexChunk, idf: Map<string, numb
 function topK(context: IndexFile, q: string, k = 6): Retrieved[] {
   const chunks = context.chunks ?? [];
   if (chunks.length === 0) return [];
-
   const qTokens = tokenize(q).slice(0, 24);
   const idf = buildIdfMap(chunks);
 
@@ -198,11 +193,28 @@ function topK(context: IndexFile, q: string, k = 6): Retrieved[] {
 }
 
 /* =========================
-   Prompt & appel OpenRouter
+   Modèles OpenRouter (fallback multi-modèles)
 ========================= */
 
 const DEFAULT_MODEL_LIST =
   "qwen/qwen-2.5-72b-instruct:free,google/gemma-2-9b-it:free,mistralai/mistral-nemo:free";
+
+function parseModelList(s: string): string[] {
+  return s
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+const MODEL_LIST: string[] = process.env.RAG_MODEL
+  ? parseModelList(process.env.RAG_MODEL)
+  : parseModelList(DEFAULT_MODEL_LIST);
+
+const DEFAULT_MODEL: string = MODEL_LIST[0] ?? "google/gemma-2-9b-it:free";
+
+/* =========================
+   Prompt & appel OpenRouter
+========================= */
 
 function systemPrompt(siteName: string | undefined): string {
   const tag = siteName ? ` pour ${siteName}` : "";
@@ -221,7 +233,7 @@ function buildUserPrompt(q: string, lang: string | undefined, retrieved: Retriev
   const ctx = retrieved
     .map((r, i) => {
       const head = r.chunk.title ? `${r.chunk.title} — ${r.chunk.url}` : r.chunk.url;
-      const body = r.chunk.text.slice(0, 4000); // garde le prompt compact
+      const body = r.chunk.text.slice(0, 4000);
       return `[#${i + 1}] ${head}\n${body}`;
     })
     .join("\n\n---\n\n");
@@ -236,8 +248,8 @@ function buildUserPrompt(q: string, lang: string | undefined, retrieved: Retriev
     `${ctx || "(aucun extrait pertinent trouvé)"}`,
     ``,
     `Consignes de réponse :`,
-    `- Réponds directement à la question, sans dire "selon la langue..." ou des méta-commentaires.`,
-    `- Si l'info n'est pas dans le contexte, dis-le et propose une alternative concrète (ex: page à visiter, contact, etc.).`,
+    `- Réponds directement à la question, sans meta-commentaires.`,
+    `- Si l'info n'est pas dans le contexte, dis-le et propose une alternative concrète (page à visiter, contact, etc.).`,
     `- Termine par une section "Sources" avec ces liens uniquement (si disponibles) :`,
     sources.length ? sources.map((u) => `- ${u}`).join("\n") : `- (Aucune source disponible)`,
   ].join("\n");
@@ -252,9 +264,9 @@ async function callOpenRouterChat(
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${apiKey}`,
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
-      // Ces deux en-têtes sont recommandés par OpenRouter (analytics/quotas)
+      // Recommandés par OpenRouter (analytics/quotas)
       "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "https://example.com",
       "X-Title": process.env.OPENROUTER_SITE_NAME ?? "Kinko FAQ AI",
     },
@@ -280,6 +292,30 @@ async function callOpenRouterChat(
   const content = json.choices?.[0]?.message?.content?.trim();
   if (!content) throw new Error("Réponse vide du modèle.");
   return content;
+}
+
+async function answerWithFallback(
+  apiKey: string,
+  system: string,
+  user: string
+): Promise<{ answer: string; modelUsed: string }> {
+  const tried: string[] = [];
+  for (const m of MODEL_LIST) {
+    try {
+      const ans = await callOpenRouterChat(apiKey, m, system, user);
+      return { answer: ans, modelUsed: m };
+    } catch (err) {
+      tried.push(m);
+      // Essayer le suivant
+    }
+  }
+  // Dernière tentative avec DEFAULT_MODEL (au cas où la liste serait vide/incorrecte)
+  const lastModel = DEFAULT_MODEL;
+  if (!tried.includes(lastModel)) {
+    const ans = await callOpenRouterChat(apiKey, lastModel, system, user);
+    return { answer: ans, modelUsed: lastModel };
+  }
+  throw new Error(`Tous les modèles ont échoué: ${tried.join(", ")}`);
 }
 
 /* =========================
@@ -315,11 +351,12 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const answer = await callOpenRouterChat(apiKey, DEFAULT_MODEL, sys, user);
+    const { answer } = await answerWithFallback(apiKey, sys, user);
 
-    // Pas de mention de langue dans la réponse ; déjà géré par le prompt.
+    // Pas de mention de langue visible : c’est géré par les consignes.
     return new NextResponse(JSON.stringify({ answer }), { status: 200, headers });
   } catch (e: unknown) {
+    // Log serveur pour debug
     console.error("[faq-ai] error:", e);
     const message = e instanceof Error ? e.message : "Unknown error";
     return new NextResponse(JSON.stringify({ error: message }), { status: 500, headers });
