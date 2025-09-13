@@ -320,7 +320,7 @@ async function loadResultsChunks(): Promise<IndexChunk[]> {
       const raw = await fs.readFile(full, "utf8");
       // Résumé "safe" pour retrieval
       let title = f.replace(/\.json$/i, "");
-      let url = `${process.env.SHOPIFY_PUBLIC_BASE ?? "https://qfxdmn-i3.myshopify.com"}/results/${encodeURIComponent(f)}`;
+      const url = `${process.env.SHOPIFY_PUBLIC_BASE ?? "https://qfxdmn-i3.myshopify.com"}/results/${encodeURIComponent(f)}`;
       let summary = raw.slice(0, 2000);
       try {
         const parsed = JSON.parse(raw) as Record<string, unknown>;
