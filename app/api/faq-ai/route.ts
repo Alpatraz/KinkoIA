@@ -201,7 +201,8 @@ function topK(context: IndexFile, q: string, k = 6): Retrieved[] {
    Prompt & appel OpenRouter
 ========================= */
 
-const DEFAULT_MODEL = process.env.RAG_MODEL ?? "meta-llama/llama-3.1-8b-instruct:free";
+const DEFAULT_MODEL_LIST =
+  "qwen/qwen-2.5-72b-instruct:free,google/gemma-2-9b-it:free,mistralai/mistral-nemo:free";
 
 function systemPrompt(siteName: string | undefined): string {
   const tag = siteName ? ` pour ${siteName}` : "";
