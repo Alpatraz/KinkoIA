@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import fs from "node:fs/promises";
 import path from "node:path";
 
+/** Next runtime hints */
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -28,6 +29,38 @@ type IndexFile = {
 type Retrieved = {
   chunk: IndexChunk;
   score: number;
+};
+
+/** Shopify Admin GraphQL types (partiels, suffisants ici) */
+type MetaobjectField = { key: string; value: string };
+type MetaobjectNode = {
+  id: string;
+  type: string;
+  handle?: string | null;
+  fields: MetaobjectField[];
+};
+type MetaobjectsResponse = {
+  data?: {
+    metaobjects: { edges: { node: MetaobjectNode }[] };
+  };
+  errors?: unknown;
+};
+
+type ArticlesResponse = {
+  data?: {
+    articles: {
+      edges: {
+        node: {
+          id: string;
+          title: string;
+          onlineStoreUrl?: string | null;
+          publishedAt?: string | null;
+          blog: { handle: string };
+        };
+      }[];
+    };
+  };
+  errors?: unknown;
 };
 
 /* =========================
@@ -63,7 +96,7 @@ async function loadIndex(): Promise<IndexFile> {
   const indexPath = path.join(root, "ingested", "index.json");
   const ingestedDir = path.join(root, "ingested");
 
-  // 1) Essayer index.json
+  // 1) Essayer index.json (format { chunks: [...] })
   try {
     const buf = await fs.readFile(indexPath, "utf8");
     const parsed = JSON.parse(buf) as unknown;
@@ -119,7 +152,7 @@ async function loadIndex(): Promise<IndexFile> {
 }
 
 /* =========================
-   Récupération : scoring simple TF-IDF-ish
+   Récupération : TF-IDF simple
 ========================= */
 
 function tokenize(s: string): string[] {
@@ -144,7 +177,7 @@ function buildIdfMap(chunks: IndexChunk[]): Map<string, number> {
   }
   const idf = new Map<string, number>();
   df.forEach((v, k) => {
-    idf.set(k, Math.log((1 + N) / (1 + v)) + 1);
+    idf.set(k, Math.log((1 + N) / (1 + v)) + 1); // IDF lissé
   });
   return idf;
 }
@@ -193,7 +226,7 @@ function topK(context: IndexFile, q: string, k = 6): Retrieved[] {
 }
 
 /* =========================
-   Modèles OpenRouter (fallback multi-modèles)
+   OpenRouter – modèles & appels
 ========================= */
 
 const DEFAULT_MODEL_LIST =
@@ -211,10 +244,6 @@ const MODEL_LIST: string[] = process.env.RAG_MODEL
   : parseModelList(DEFAULT_MODEL_LIST);
 
 const DEFAULT_MODEL: string = MODEL_LIST[0] ?? "google/gemma-2-9b-it:free";
-
-/* =========================
-   Prompt & appel OpenRouter
-========================= */
 
 function systemPrompt(siteName: string | undefined): string {
   const tag = siteName ? ` pour ${siteName}` : "";
@@ -266,7 +295,6 @@ async function callOpenRouterChat(
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
-      // Recommandés par OpenRouter (analytics/quotas)
       "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "https://example.com",
       "X-Title": process.env.OPENROUTER_SITE_NAME ?? "Kinko FAQ AI",
     },
@@ -285,10 +313,9 @@ async function callOpenRouterChat(
     throw new Error(`OpenRouter error ${res.status}: ${text}`);
   }
 
-  type Choice = { message: { role: "assistant"; content: string } };
-  type ORResponse = { choices: Choice[] };
-
-  const json = (await res.json()) as ORResponse;
+  const json = (await res.json()) as {
+    choices?: { message?: { role?: string; content?: string } }[];
+  };
   const content = json.choices?.[0]?.message?.content?.trim();
   if (!content) throw new Error("Réponse vide du modèle.");
   return content;
@@ -316,177 +343,183 @@ async function answerWithFallback(
   throw new Error(`Tous les modèles ont échoué: ${tried.join(", ")}`);
 }
 
-/* ========= Temps réel Shopify : prochaine compétition ========= */
+/* =========================
+   Shopify Admin – helpers temps réel
+========================= */
 
-type ShopifyField = { key: string; value: string | null };
-type ShopifyMetaNode = {
-  id: string;
-  handle: string;
-  type: string;
-  updatedAt: string;
-  fields: ShopifyField[];
-};
+function hasShopifyAdmin(): boolean {
+  return Boolean(process.env.SHOPIFY_SHOP && process.env.SHOPIFY_ADMIN_TOKEN);
+}
 
-type NextEvent = {
-  id: string;
-  title: string;
-  dateISO: string;
-  location?: string;
-  link?: string;
-  source?: string;
-};
-
-const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP ?? "";
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN ?? "";
-const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION ?? "2024-07";
-const SHOPIFY_PUBLIC_BASE = (process.env.SHOPIFY_PUBLIC_BASE ?? "").replace(/\/+$/, "");
-const SHOPIFY_META_TYPES = (process.env.SHOPIFY_METAOBJECT_TYPES ?? "event,competition")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-const SHOPIFY_CALENDAR_URL = process.env.SHOPIFY_CALENDAR_URL ?? "";
-const SHOPIFY_GQL_URL = SHOPIFY_SHOP
-  ? `https://${SHOPIFY_SHOP}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`
-  : "";
-
-async function shopifyAdminGQL<T extends Record<string, unknown>>(
+/** Appel générique Admin GraphQL */
+async function adminGraphQL<T = unknown>(
   query: string,
   variables?: Record<string, unknown>
 ): Promise<T> {
-  if (!SHOPIFY_SHOP || !SHOPIFY_ADMIN_TOKEN) {
-    throw new Error("SHOPIFY_SHOP ou SHOPIFY_ADMIN_TOKEN manquant.");
-  }
-  const res = await fetch(SHOPIFY_GQL_URL, {
+  const shop = process.env.SHOPIFY_SHOP!;
+  const token = process.env.SHOPIFY_ADMIN_TOKEN!;
+  const apiVersion = process.env.SHOPIFY_API_VERSION ?? "2024-10";
+  const endpoint = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
+
+  const res = await fetch(endpoint, {
     method: "POST",
     headers: {
+      "X-Shopify-Access-Token": token,
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
     },
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-expect-error Next runtime accepte 'no-store' côté serveur
     cache: "no-store",
     body: JSON.stringify({ query, variables }),
   });
-  const json = (await res.json()) as { data?: T; errors?: unknown };
-  if (!res.ok || json.errors) {
-    throw new Error(`Shopify GraphQL error ${res.status}: ${JSON.stringify(json.errors ?? json)}`);
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Shopify Admin GraphQL ${res.status}: ${text}`);
   }
-  if (!json.data) throw new Error("Réponse Shopify vide.");
-  return json.data;
+
+  const json = (await res.json()) as T;
+  return json;
 }
 
-function extractEventLike(fields: ShopifyField[]) {
-  const byKey = new Map<string, string>();
-  for (const f of fields) if (f.value) byKey.set(f.key.toLowerCase(), f.value);
-
-  const pick = (candidates: string[]): string | undefined => {
-    for (const k of candidates) {
-      const v = byKey.get(k);
-      if (v && String(v).trim()) return String(v);
-    }
-    const rx = new RegExp(candidates.join("|"), "i");
-    for (const [k, v] of byKey) if (rx.test(k) && v.trim()) return v.trim();
-    return undefined;
-  };
-
-  const title = pick(["title", "name", "nom", "titre"]) ?? "Compétition";
-  const dateRaw = pick(["date", "start_date", "start", "when", "date_time", "datetime"]);
-  const location = pick(["location", "lieu", "city", "place", "ville"]);
-  const link = pick(["url", "link", "registration", "inscription"]);
-
-  return { title, dateRaw, location, link };
-}
-
-function toISO(s?: string): string | null {
+/** Parse une date ISO (ou proche) en Date, sans throw */
+function parseDateMaybe(s: string | undefined): Date | null {
   if (!s) return null;
-  const d1 = new Date(s);
-  if (!Number.isNaN(d1.getTime())) return d1.toISOString();
-  const m = s.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
-  if (m) {
-    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).toISOString();
-  }
-  return null;
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
-function formatFR(iso: string): string {
-  try {
-    return new Intl.DateTimeFormat("fr-FR", {
-      weekday: "long",
-      year: "numeric",
-      month: "long",
-      day: "numeric",
-      timeZone: "UTC",
-    }).format(new Date(iso));
-  } catch {
-    return iso;
-  }
-}
+/** Récupère la prochaine compétition via metaobjects Admin */
+async function fetchNextEventChunk(): Promise<IndexChunk | null> {
+  if (!hasShopifyAdmin()) return null;
 
-async function fetchNextEvent(): Promise<NextEvent | null> {
-  if (!SHOPIFY_META_TYPES.length) return null;
+  const typeHandle = process.env.SHOPIFY_EVENT_METAOBJECT ?? "event";
+  const dateKey = process.env.SHOPIFY_EVENT_DATE_FIELD ?? "date";
+  const titleKey = process.env.SHOPIFY_EVENT_TITLE_FIELD ?? "title";
+  const urlKey = process.env.SHOPIFY_EVENT_URL_FIELD ?? "url";
+  const locKey = process.env.SHOPIFY_EVENT_LOCATION_FIELD ?? "location";
+  const calendarPath = process.env.SHOPIFY_CALENDAR_URL ?? "/pages/calendrier";
 
   const q = `
-    query Meta($type: String!, $cursor: String) {
-      metaobjects(type: $type, first: 100, after: $cursor) {
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          id handle type updatedAt
-          fields { key value }
+    query NextEvents($type: String!, $first: Int!) {
+      metaobjects(type: $type, first: $first) {
+        edges {
+          node {
+            id
+            handle
+            type
+            fields { key value }
+          }
         }
       }
     }
   `;
 
-  const now = Date.now();
-  let best:
-    | { iso: string; node: ShopifyMetaNode; meta: ReturnType<typeof extractEventLike> }
-    | null = null;
+  const resp = await adminGraphQL<MetaobjectsResponse>(q, {
+    type: typeHandle,
+    first: 50,
+  });
 
-  for (const type of SHOPIFY_META_TYPES) {
-    let cursor: string | null = null;
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      const data = await shopifyAdminGQL<{
-        metaobjects: {
-          pageInfo: { hasNextPage: boolean; endCursor: string | null };
-          nodes: ShopifyMetaNode[];
-        };
-      }>(q, { type, cursor });
+  const edges = resp.data?.metaobjects?.edges ?? [];
+  type EventItem = {
+    id: string;
+    title?: string;
+    dateISO?: string;
+    when?: Date | null;
+    url?: string;
+    location?: string;
+  };
 
-      const { nodes, pageInfo } = data.metaobjects;
+  const events: EventItem[] = edges.map(({ node }) => {
+    const map = new Map(node.fields.map((f) => [f.key, f.value]));
+    const dateISO = map.get(dateKey);
+    const when = parseDateMaybe(dateISO);
+    return {
+      id: node.id,
+      title: map.get(titleKey) ?? node.handle ?? "Événement",
+      dateISO,
+      when,
+      url: map.get(urlKey) ?? `https://${process.env.SHOPIFY_SHOP}${calendarPath}`,
+      location: map.get(locKey) ?? undefined,
+    };
+  });
 
-      for (const n of nodes) {
-        const meta = extractEventLike(n.fields);
-        const iso = toISO(meta.dateRaw);
-        if (!iso) continue;
-        const ts = new Date(iso).getTime();
-        if (Number.isNaN(ts) || ts < now) continue;
-        if (!best || ts < new Date(best.iso).getTime()) {
-          best = { iso, node: n, meta };
-        }
-      }
+  const now = new Date();
+  const upcoming = events
+    .filter((e) => e.when && e.when.getTime() >= now.getTime())
+    .sort((a, b) => (a.when!.getTime() - b.when!.getTime()));
 
-      if (!pageInfo.hasNextPage) break;
-      cursor = pageInfo.endCursor;
-      await new Promise((r) => setTimeout(r, 120));
-    }
-  }
+  const next = upcoming[0];
+  if (!next) return null;
 
-  if (!best) return null;
+  const dateFmt = next.when!.toLocaleDateString("fr-CA", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
 
-  const publicSource =
-    best.meta.link ||
-    SHOPIFY_CALENDAR_URL ||
-    (SHOPIFY_PUBLIC_BASE ? `${SHOPIFY_PUBLIC_BASE}/pages/calendrier` : "");
+  const text = [
+    `Prochaine compétition : ${next.title ?? "À confirmer"}`,
+    `Date : ${dateFmt}${next.location ? ` – Lieu : ${next.location}` : ""}`,
+    `Inscription / infos : ${next.url}`,
+  ].join("\n");
 
   return {
-    id: best.node.id,
-    title: best.meta.title,
-    dateISO: best.iso,
-    location: best.meta.location,
-    link: best.meta.link || undefined,
-    source: publicSource || undefined,
+    id: "shopify:next-event",
+    url: next.url ?? `https://${process.env.SHOPIFY_SHOP}${calendarPath}`,
+    title: next.title ?? "Prochaine compétition",
+    text,
   };
+}
+
+/** (Optionnel) derniers articles de blog pour renforcer le contexte */
+async function fetchLatestArticlesChunk(): Promise<IndexChunk | null> {
+  if (!hasShopifyAdmin()) return null;
+
+  const q = `
+    query LatestArticles($first: Int!) {
+      articles(first: $first, sortKey: PUBLISHED_AT, reverse: true) {
+        edges {
+          node {
+            id
+            title
+            onlineStoreUrl
+            publishedAt
+            blog { handle }
+          }
+        }
+      }
+    }
+  `;
+  const resp = await adminGraphQL<ArticlesResponse>(q, { first: 5 });
+  const edges = resp.data?.articles?.edges ?? [];
+  if (edges.length === 0) return null;
+
+  const lines = edges.map(({ node }, i) => {
+    const d =
+      node.publishedAt &&
+      new Date(node.publishedAt).toLocaleDateString("fr-CA", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      });
+    const url = node.onlineStoreUrl ?? `https://${process.env.SHOPIFY_SHOP}/blogs/${node.blog.handle}/${node.title}`;
+    return `[#${i + 1}] ${node.title}${d ? ` (${d})` : ""}\n${url}`;
+  });
+
+  return {
+    id: "shopify:latest-articles",
+    url: `https://${process.env.SHOPIFY_SHOP}/blogs`,
+    title: "Derniers articles du blog",
+    text: lines.join("\n\n"),
+  };
+}
+
+/* =========================
+   Utils détection d’intention
+========================= */
+
+function includesAny(haystack: string, needles: string[]): boolean {
+  const s = haystack.toLowerCase();
+  return needles.some((n) => s.includes(n));
 }
 
 /* =========================
@@ -505,61 +538,62 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    // 1) Charger l’index local
     const index = await loadIndex();
 
-    // Détection d’intention “prochaine compétition / date tournoi…”
-    const wantsNext =
-      /prochain|prochaine|next|bient[oô]t|date|quand/i.test(q) &&
-      /(comp[ée]tition|tournoi|event|év[ée]nement)/i.test(q);
+    // 2) Récup basique
+    const retrieved = topK(index, q, 6);
 
-    let retrieved = topK(index, q, 6);
+    // 3) Temps réel Shopify si pertinent (prochaine compétition / calendrier)
+    const needEvent =
+      includesAny(q, ["prochaine", "prochain", "date", "compétition", "tournoi", "événement", "event", "calendrier"]) ||
+      includesAny(q, ["next", "tournament", "competition", "event", "calendar"]);
 
-    // Chunk “temps réel” Shopify si pertinent
-    if (wantsNext) {
+    if (needEvent) {
       try {
-        const ev = await fetchNextEvent();
-        if (ev) {
-          const prettyDate = formatFR(ev.dateISO);
-          const lines = [
-            `Prochaine compétition (temps réel Shopify)`,
-            `Titre : ${ev.title}`,
-            `Date : ${prettyDate}`,
-            ev.location ? `Lieu : ${ev.location}` : ``,
-            ev.link ? `Inscription : ${ev.link}` : ``,
-            ev.source ? `Source : ${ev.source}` : ``,
-          ]
-            .filter(Boolean)
-            .join("\n");
-
-          const realtimeChunk: IndexChunk = {
-            id: `realtime_event_${ev.id}`,
-            url: ev.link || ev.source || SHOPIFY_PUBLIC_BASE || "",
-            title: `Prochaine compétition : ${ev.title}`,
-            text: lines,
-          };
-
-          retrieved = [{ chunk: realtimeChunk, score: 1e9 }, ...retrieved];
+        const nextEvent = await fetchNextEventChunk();
+        if (nextEvent) {
+          retrieved.unshift({ chunk: nextEvent, score: 1e6 }); // booste fort le contexte
         }
-      } catch {
-        // silencieux : on retombe sur RAG normal
+      } catch (e) {
+        // On n’échoue pas la requête si Shopify n’est pas dispo
+        console.warn("[faq-ai] fetchNextEventChunk failed:", e);
       }
     }
 
+    // 4) (Optionnel) si l’utilisateur parle de blog/actu, injecter les derniers articles
+    const needBlog =
+      includesAny(q, ["blog", "article", "actualité", "actualite", "news", "publication", "post"]);
+
+    if (needBlog) {
+      try {
+        const blogChunk = await fetchLatestArticlesChunk();
+        if (blogChunk) {
+          retrieved.push({ chunk: blogChunk, score: 1e5 });
+        }
+      } catch (e) {
+        console.warn("[faq-ai] fetchLatestArticlesChunk failed:", e);
+      }
+    }
+
+    // 5) Construire le prompt
     const sys = systemPrompt(process.env.RAG_SITE_NAME);
     const user = buildUserPrompt(q, lang, retrieved);
 
+    // 6) Appel modèle
     const apiKey = process.env.OPENROUTER_API_KEY ?? "";
     if (!apiKey) {
       return new NextResponse(
         JSON.stringify({
-          error:
-            "OPENROUTER_API_KEY manquant. Ajoutez-le aux variables d’environnement du projet Vercel.",
+          error: "OPENROUTER_API_KEY manquant. Ajoutez-le aux variables d’environnement du projet Vercel.",
         }),
         { status: 500, headers }
       );
     }
 
     const { answer } = await answerWithFallback(apiKey, sys, user);
+
+    // 7) Retour
     return new NextResponse(JSON.stringify({ answer }), { status: 200, headers });
   } catch (e: unknown) {
     console.error("[faq-ai] error:", e);
