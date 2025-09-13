@@ -38,6 +38,23 @@ type EventItem = {
   url?: string;
 };
 
+/* ==== Types GraphQL Shopify (réponse Metaobjects) ==== */
+type ShopifyField = { key: string; value: string };
+
+type ShopifyMetaobject = {
+  id?: string;
+  handle?: string;
+  fields?: ShopifyField[];
+};
+
+type ShopifyMetaobjectsResponse = {
+  data?: {
+    metaobjects?: {
+      edges?: Array<{ node?: ShopifyMetaobject }>;
+    };
+  };
+};
+
 /* =========================
    CORS utils
 ========================= */
@@ -363,7 +380,7 @@ function shopDomainFromBase(): string | null {
 }
 
 // Tente de repérer les clés probables dans tes metaobjects
-function parseEventFields(fields: Array<{ key: string; value: string }>): EventItem {
+function parseEventFields(fields: ShopifyField[]): EventItem {
   const map: Record<string, string> = {};
   for (const f of fields) map[f.key.toLowerCase()] = f.value;
 
@@ -411,7 +428,10 @@ async function fetchNextEvent(): Promise<EventItem | null> {
   });
 
   if (!resp.ok) return null;
-  const data = await resp.json().catch(() => null) as any;
+
+  const dataUnknown = await resp.json().catch(() => null) as unknown;
+  const data = dataUnknown as ShopifyMetaobjectsResponse;
+
   const edges = data?.data?.metaobjects?.edges ?? [];
   if (!Array.isArray(edges) || edges.length === 0) return null;
 
@@ -420,8 +440,8 @@ async function fetchNextEvent(): Promise<EventItem | null> {
   const upcoming: Array<{ item: EventItem; sortKey: number }> = [];
 
   for (const e of edges) {
-    const fields = e?.node?.fields as Array<{ key: string; value: string }>;
-    if (!Array.isArray(fields)) continue;
+    const fields = e?.node?.fields ?? [];
+    if (!Array.isArray(fields) || fields.length === 0) continue;
     const it = parseEventFields(fields);
     if (!it.start) continue;
     const start = new Date(it.start);
