@@ -21,27 +21,12 @@ type IndexChunk = {
   tokens?: number;
 };
 
-type IndexFile = {
-  chunks: IndexChunk[];
-};
+type IndexFile = { chunks: IndexChunk[] };
 
-type Retrieved = {
-  chunk: IndexChunk;
-  score: number;
-};
-
-type NextEvent = {
-  title: string;
-  start: string; // ISO
-  end?: string | null;
-  location?: string | null;
-  url?: string | null;
-  organizer?: string | null;
-  source: "admin" | "storefront" | "env";
-};
+type Retrieved = { chunk: IndexChunk; score: number };
 
 /* =========================
-   CORS utils
+   CORS
 ========================= */
 
 function corsHeaders(req: NextRequest): Headers {
@@ -61,34 +46,27 @@ export async function OPTIONS(req: NextRequest) {
 }
 
 /* =========================
-   Helpers URLs / ENV
+   Utils
 ========================= */
 
-function baseUrl(): string {
-  // ex: https://qfxdmn-i3.myshopify.com (sans /final)
-  const b = (process.env.SHOPIFY_PUBLIC_BASE ?? "").replace(/\/+$/, "");
-  return b.replace(/^https?:\/\/www\./, "https://");
+function normalizeUrl(u: string): string {
+  return u.replace(/^https?:\/\/(www\.)?/i, "https://");
 }
 
-function shopDomain(): string | null {
-  try {
-    const u = new URL(baseUrl());
-    return u.host; // qfxdmn-i3.myshopify.com
-  } catch {
-    return null;
-  }
+function fmtDateISO(d: string | Date): string {
+  const dt = typeof d === "string" ? new Date(d) : d;
+  if (Number.isNaN(dt.getTime())) return "";
+  return dt.toLocaleDateString("fr-FR", { day: "2-digit", month: "long", year: "numeric" });
 }
 
-function sanitizeUrl(u?: string | null): string | undefined {
-  if (!u) return undefined;
-  const b = baseUrl();
-  return u
-    .replace(/^https?:\/\/www\./, "https://")
-    .replace(/^https?:\/\/qfxdmn-i3\.myshopify\.com/i, b);
+function isEventQuestion(q: string): boolean {
+  const s = q.toLowerCase();
+  return /(prochain|prochaine|date|quand).*(comp(é|e)tition|tournoi|év(é|e)nement|event)/i.test(s) ||
+         /(comp(é|e)tition|tournoi|év(é|e)nement|event).*(prochain|prochaine|date|quand)/i.test(s);
 }
 
 /* =========================
-   Lecture de l'index / fallback
+   Lecture de l'index
 ========================= */
 
 let cachedIndex: IndexFile | null = null;
@@ -100,11 +78,10 @@ async function loadIndex(): Promise<IndexFile> {
   const indexPath = path.join(root, "ingested", "index.json");
   const ingestedDir = path.join(root, "ingested");
 
-  // 1) Essayer index.json
+  // 1) index.json
   try {
     const buf = await fs.readFile(indexPath, "utf8");
     const parsed = JSON.parse(buf) as unknown;
-
     if (
       parsed &&
       typeof parsed === "object" &&
@@ -113,9 +90,10 @@ async function loadIndex(): Promise<IndexFile> {
     ) {
       const chunks = (parsed as { chunks: unknown[] }).chunks.map((c, i) => {
         const obj = c as Record<string, unknown>;
+        const url = normalizeUrl(String(obj.url ?? ""));
         return {
           id: String(obj.id ?? i.toString()),
-          url: String(obj.url ?? ""),
+          url,
           title: obj.title ? String(obj.title) : undefined,
           text: String(obj.text ?? (obj as Record<string, unknown>).content ?? ""),
           tokens: typeof obj.tokens === "number" ? obj.tokens : undefined,
@@ -125,10 +103,10 @@ async function loadIndex(): Promise<IndexFile> {
       return cachedIndex;
     }
   } catch {
-    // ignore ; tentative fallback dessous
+    /* pass */
   }
 
-  // 2) Fallback: lire tous les .md de /ingested et créer 1 chunk par fichier
+  // 2) fallback .md
   const chunks: IndexChunk[] = [];
   try {
     const files = await fs.readdir(ingestedDir);
@@ -136,19 +114,14 @@ async function loadIndex(): Promise<IndexFile> {
       if (!file.toLowerCase().endsWith(".md")) continue;
       const full = path.join(ingestedDir, file);
       const content = await fs.readFile(full, "utf8");
-      const guessedUrl = file
-        .replaceAll("_", "/")
-        .replace(/\.md$/i, "")
-        .replace(/^https?:\/\//i, "");
-      chunks.push({
-        id: file,
-        url: "https://" + guessedUrl,
-        title: file,
-        text: content,
-      });
+      const guessedUrl = normalizeUrl(
+        "https://" +
+          file.replaceAll("_", "/").replace(/\.md$/i, "").replace(/^https?:\/\//i, "")
+      );
+      chunks.push({ id: file, url: guessedUrl, title: file, text: content });
     }
   } catch {
-    // pas de .md non plus → index vide
+    /* pass */
   }
 
   cachedIndex = { chunks };
@@ -156,7 +129,7 @@ async function loadIndex(): Promise<IndexFile> {
 }
 
 /* =========================
-   Récupération : TF-IDF light
+   Retrieval (TF-IDF simple)
 ========================= */
 
 function tokenize(s: string): string[] {
@@ -172,17 +145,11 @@ function buildIdfMap(chunks: IndexChunk[]): Map<string, number> {
   const df = new Map<string, number>();
   const N = Math.max(1, chunks.length);
   for (const ch of chunks) {
-    const seen = new Set<string>();
-    for (const t of new Set(tokenize(ch.text))) {
-      if (seen.has(t)) continue;
-      seen.add(t);
-      df.set(t, (df.get(t) ?? 0) + 1);
-    }
+    const seen = new Set(tokenize(ch.text));
+    for (const t of seen) df.set(t, (df.get(t) ?? 0) + 1);
   }
   const idf = new Map<string, number>();
-  df.forEach((v, k) => {
-    idf.set(k, Math.log((1 + N) / (1 + v)) + 1);
-  });
+  df.forEach((v, k) => idf.set(k, Math.log((1 + N) / (1 + v)) + 1));
   return idf;
 }
 
@@ -207,7 +174,6 @@ function scoreChunk(queryTokens: string[], ch: IndexChunk, idf: Map<string, numb
     for (const qt of queryTokens) if (titleTokens.has(qt)) hits++;
     score *= 1 + Math.min(0.3, hits * 0.05);
   }
-
   return score;
 }
 
@@ -224,7 +190,53 @@ function topK(context: IndexFile, q: string, k = 6): Retrieved[] {
 }
 
 /* =========================
-   OpenRouter (fallback multi-modèles)
+   Chunk "prochaine compétition" (temps réel via env)
+========================= */
+
+function nextEventChunkFromEnv(): IndexChunk | null {
+  const v = process.env.NEXT_EVENT_JSON;
+  if (!v) return null;
+  try {
+    const parsed = JSON.parse(v) as {
+      title?: string;
+      start?: string;
+      end?: string;
+      location?: string;
+      url?: string;
+      organizer?: string;
+    };
+
+    const title = parsed.title ?? "Prochaine compétition";
+    const dateStr = parsed.start ? fmtDateISO(parsed.start) : "";
+    const endStr = parsed.end ? fmtDateISO(parsed.end) : "";
+    const where = parsed.location ? ` — Lieu : ${parsed.location}` : "";
+    const org = parsed.organizer ? ` — Organisateur : ${parsed.organizer}` : "";
+    const url = parsed.url ? normalizeUrl(parsed.url) : "";
+
+    const when =
+      dateStr && endStr && dateStr !== endStr
+        ? `${dateStr} → ${endStr}`
+        : dateStr || endStr || "(date à confirmer)";
+
+    const textLines = [
+      `Prochaine compétition : ${title}`,
+      `Date : ${when}${where}${org}`,
+      url ? `Lien d'information / inscription : ${url}` : ``,
+    ].filter(Boolean);
+
+    return {
+      id: "next_event",
+      url: url || "https://qfxdmn-i3.myshopify.com/pages/calendrier",
+      title: "Prochaine compétition",
+      text: textLines.join("\n"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/* =========================
+   Modèles OpenRouter (fallback)
 ========================= */
 
 const DEFAULT_MODEL_LIST =
@@ -243,16 +255,17 @@ const MODEL_LIST: string[] = process.env.RAG_MODEL
 
 const DEFAULT_MODEL: string = MODEL_LIST[0] ?? "google/gemma-2-9b-it:free";
 
-function systemPrompt(siteName: string | undefined): string {
+/* =========================
+   Prompt & OpenRouter
+========================= */
+
+function systemPrompt(siteName?: string): string {
   const tag = siteName ? ` pour ${siteName}` : "";
   return [
     `Tu es “Sempaï Kinko”, un assistant d’aide et de vente${tag}.`,
-    `Objectif : répondre clairement, brièvement, et utilement.`,
-    `Règles :`,
-    `- Langue : réponds dans la langue demandée (fr par défaut si non précisé).`,
-    `- Si la réponse n'est pas dans le contexte, dis-le simplement et propose d'aider à la trouver (pas d'invention).`,
-    `- Quand c’est pertinent, oriente vers l’achat/inscription/contact.`,
-    `- Ajoute une courte section "Sources" avec 1–3 liens pertinents tirés du contexte (pas d’autres liens).`,
+    `Parle clairement et utilement.`,
+    `Si l’info n’est pas dans le contexte, dis-le et propose une alternative concrète (page, contact, etc.).`,
+    `Quand tu cites des pages, mets des liens HTML cliquables (<a href="...">texte</a>).`,
   ].join("\n");
 }
 
@@ -260,27 +273,33 @@ function buildUserPrompt(q: string, lang: string | undefined, retrieved: Retriev
   const ctx = retrieved
     .map((r, i) => {
       const head = r.chunk.title ? `${r.chunk.title} — ${r.chunk.url}` : r.chunk.url;
-      const body = r.chunk.text.slice(0, 4000);
+      const body = r.chunk.text.slice(0, 3500);
       return `[#${i + 1}] ${head}\n${body}`;
     })
     .join("\n\n---\n\n");
 
-  const sources = Array.from(new Set(retrieved.map((r) => r.chunk.url))).slice(0, 3);
+  const dedup = Array.from(new Set(retrieved.map((r) => r.chunk.url))).slice(0, 3);
+  const sourcesHtml = dedup
+    .map((u) => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`)
+    .join("\n- ");
 
   return [
     `Question: ${q}`,
-    lang ? `Langue attendue: ${lang}` : `Langue attendue: fr`,
+    `Langue attendue: ${lang || "fr"}`,
     ``,
-    `Contexte (extraits provenant du site) :`,
-    `${ctx || "(aucun extrait pertinent trouvé)"}`,
+    `Contexte (extraits) :`,
+    ctx || "(aucun extrait pertinent trouvé)",
     ``,
     `Consignes de réponse :`,
-    `- Réponds directement à la question, sans meta-commentaires.`,
-    `- Si l'info n'est pas dans le contexte, dis-le et propose une alternative concrète (page à visiter, contact, etc.).`,
-    `- Termine par une section "Sources" avec ces liens uniquement (si disponibles) :`,
-    sources.length ? sources.map((u) => `- ${u}`).join("\n") : `- (Aucune source disponible)`,
+    `- Réponds directement, sans méta-commentaires.`,
+    `- Termine par un bloc "Sources :" listant 1–3 liens pertinents (HTML <a>) tirés du contexte.`,
+    `Sources (pré-sélection) :`,
+    sourcesHtml ? `- ${sourcesHtml}` : `- (Aucune source disponible)`,
   ].join("\n");
 }
+
+type ORChoice = { message: { role: "assistant"; content: string } };
+type ORResp = { choices?: ORChoice[] };
 
 async function callOpenRouterChat(
   apiKey: string,
@@ -311,10 +330,7 @@ async function callOpenRouterChat(
     throw new Error(`OpenRouter error ${res.status}: ${text}`);
   }
 
-  type Choice = { message: { role: "assistant"; content: string } };
-  type ORResponse = { choices: Choice[] };
-
-  const json = (await res.json()) as ORResponse;
+  const json = (await res.json()) as ORResp;
   const content = json.choices?.[0]?.message?.content?.trim();
   if (!content) throw new Error("Réponse vide du modèle.");
   return content;
@@ -343,198 +359,15 @@ async function answerWithFallback(
 }
 
 /* =========================
-   Shopify GraphQL helpers
+   POST
 ========================= */
-
-async function shopifyGraphqlAdmin<T>(query: string, variables?: Record<string, unknown>): Promise<T> {
-  const domain = shopDomain();
-  const token = process.env.SHOPIFY_ADMIN_TOKEN;
-  if (!domain || !token) throw new Error("SHOPIFY_ADMIN_TOKEN ou SHOPIFY_PUBLIC_BASE manquant.");
-
-  const res = await fetch(`https://${domain}/admin/api/2024-10/graphql.json`, {
-    method: "POST",
-    headers: {
-      "X-Shopify-Access-Token": token,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const json = (await res.json()) as T;
-  return json;
-}
-
-async function shopifyGraphqlStorefront<T>(
-  query: string,
-  variables?: Record<string, unknown>
-): Promise<T> {
-  const domain = shopDomain();
-  const token = process.env.SHOPIFY_STOREFRONT_TOKEN;
-  if (!domain || !token) throw new Error("SHOPIFY_STOREFRONT_TOKEN ou SHOPIFY_PUBLIC_BASE manquant.");
-
-  const res = await fetch(`https://${domain}/api/2024-10/graphql.json`, {
-    method: "POST",
-    headers: {
-      "X-Shopify-Storefront-Access-Token": token,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const json = (await res.json()) as T;
-  return json;
-}
-
-/* =========================
-   Prochaine compétition (Admin / Storefront / ENV)
-========================= */
-
-const EVENT_TYPES = ["event", "evenement", "competition"];
-
-function readNextEventFromEnv(): NextEvent | null {
-  try {
-    const raw = process.env.NEXT_EVENT_JSON;
-    if (!raw) return null;
-    const j = JSON.parse(raw) as Record<string, unknown>;
-    const startRaw = String(j.start ?? "");
-    if (!j.title || !startRaw) return null;
-    const start = new Date(startRaw);
-    if (isNaN(start.getTime())) return null;
-    return {
-      title: String(j.title),
-      start: start.toISOString(),
-      end: j.end ? new Date(String(j.end)).toISOString() : null,
-      location: j.location ? String(j.location) : null,
-      url: sanitizeUrl((j.url as string) || `${baseUrl()}/pages/calendrier`),
-      organizer: j.organizer ? String(j.organizer) : null,
-      source: "env",
-    };
-  } catch {
-    return null;
-  }
-}
-
-function toEventFromFields(fields: Array<{ key: string; value: string }>, source: NextEvent["source"]): NextEvent | null {
-  const m = new Map(fields.map((f) => [f.key.toLowerCase(), f.value]));
-  const title = m.get("title") ?? m.get("nom") ?? m.get("name");
-  const start = m.get("start") ?? m.get("date") ?? m.get("debut");
-  if (!title || !start) return null;
-  return {
-    title,
-    start: new Date(start).toISOString(),
-    end: m.get("end") ? new Date(String(m.get("end"))).toISOString() : null,
-    location: m.get("location") ?? m.get("lieu") ?? null,
-    url: sanitizeUrl(m.get("url") ?? undefined) ?? `${baseUrl()}/pages/calendrier`,
-    organizer: m.get("organizer") ?? m.get("organisateur") ?? null,
-    source,
-  };
-}
-
-async function fetchNextEventAdmin(): Promise<NextEvent | null> {
-  type Node = { type: string; fields: Array<{ key: string; value: string }> };
-  type AdminResp = { data?: { metaobjects?: { nodes: Node[] } } };
-
-  for (const t of EVENT_TYPES) {
-    const q = `
-      query($t: String!) {
-        metaobjects(type: $t, first: 50) {
-          nodes { type fields { key value } }
-        }
-      }`;
-    const r = await shopifyGraphqlAdmin<AdminResp>(q, { t }).catch(() => null);
-    const nodes = r?.data?.metaobjects?.nodes ?? [];
-    const events = nodes
-      .map((n) => toEventFromFields(n.fields, "admin"))
-      .filter((e): e is NextEvent => !!e);
-    const now = Date.now();
-    const upcoming = events.filter((e) => new Date(e.start).getTime() >= now);
-    if (upcoming.length) {
-      upcoming.sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
-      return upcoming[0];
-    }
-  }
-  return null;
-}
-
-async function fetchNextEventStorefront(): Promise<NextEvent | null> {
-  type Edge = { node: { type: string; fields: Array<{ key: string; value: string }> } };
-  type SFResp = { data?: { metaobjects?: { edges: Edge[] } } };
-
-  for (const t of EVENT_TYPES) {
-    const q = `
-      {
-        metaobjects(type: "${t}", first: 50) {
-          edges { node { type fields { key value } } }
-        }
-      }`;
-    const r = await shopifyGraphqlStorefront<SFResp>(q).catch(() => null);
-    const edges = r?.data?.metaobjects?.edges ?? [];
-    const events = edges
-      .map((e) => toEventFromFields(e.node.fields, "storefront"))
-      .filter((e): e is NextEvent => !!e);
-    const now = Date.now();
-    const upcoming = events.filter((e) => new Date(e.start).getTime() >= now);
-    if (upcoming.length) {
-      upcoming.sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
-      return upcoming[0];
-    }
-  }
-  return null;
-}
-
-async function fetchNextEventSmart(): Promise<NextEvent | null> {
-  // 1) Essai Admin
-  try {
-    const admin = await fetchNextEventAdmin();
-    if (admin) return admin;
-  } catch {
-    // ignore
-  }
-  // 2) Essai Storefront
-  try {
-    const sf = await fetchNextEventStorefront();
-    if (sf) return sf;
-  } catch {
-    // ignore
-  }
-  // 3) Fallback ENV
-  const env = readNextEventFromEnv();
-  if (env) return env;
-
-  return null;
-}
-
-function htmlAnswerForEvent(ev: NextEvent): string {
-  const d = new Date(ev.start);
-  const fmt = d.toLocaleDateString("fr-CA", { year: "numeric", month: "long", day: "numeric" });
-  const pieces: string[] = [];
-  pieces.push(`La prochaine compétition est <b>${ev.title}</b>.`);
-  pieces.push(`📅 <b>Date</b> : ${fmt}`);
-  if (ev.location) pieces.push(`📍 <b>Lieu</b> : ${ev.location}`);
-  if (ev.organizer) pieces.push(`🏷️ <b>Organisateur</b> : ${ev.organizer}`);
-  const link = ev.url ?? `${baseUrl()}/pages/calendrier`;
-  const src = `${baseUrl()}/pages/calendrier`;
-
-  return [
-    pieces.join("<br/>"),
-    "",
-    `👉 <a href="${link}" target="_blank" rel="noopener">Détails / Inscription</a>`,
-    "",
-    `<div style="margin-top:8px"><b>Sources :</b><br/>- <a href="${src}" target="_blank" rel="noopener">Calendrier des compétitions et des événements</a></div>`,
-  ].join("\n");
-}
-
-/* =========================
-   Handler POST
-========================= */
-
-const NEXT_EVENT_RE = /(prochain|prochaine).*(comp[eé]tition|tournoi|[eé]v[ée]nement)|quand.*(comp[eé]tition|tournoi|[eé]v[ée]nement)/i;
 
 export async function POST(req: NextRequest) {
   const headers = corsHeaders(req);
 
   try {
-    const { q, lang } = (await req.json()) as FaqAiRequest;
+    const body = (await req.json()) as unknown;
+    const { q, lang } = (body as FaqAiRequest) ?? {};
     if (!q || typeof q !== "string") {
       return new NextResponse(JSON.stringify({ error: "Paramètre 'q' manquant." }), {
         status: 400,
@@ -542,31 +375,24 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 0) Question "prochaine compétition" → réponse déterministe en priorité
-    if (NEXT_EVENT_RE.test(q.toLowerCase())) {
-      const ev = await fetchNextEventSmart();
-      if (ev) {
-        const answer = htmlAnswerForEvent(ev);
-        return new NextResponse(JSON.stringify({ answer }), { status: 200, headers });
+    const index = await loadIndex();
+    let retrieved = topK(index, q, 6);
+
+    // 🔸 Injection temps réel "prochaine compétition"
+    if (isEventQuestion(q)) {
+      const nextEvt = nextEventChunkFromEnv();
+      if (nextEvt) {
+        retrieved = [{ chunk: nextEvt, score: 999 }, ...retrieved];
       }
-      // sinon, on continue vers le RAG + LLM
     }
 
-    // 1) RAG classique
-    const index = await loadIndex();
-    const retrieved = topK(index, q, 6);
-
-    // 2) Prompt & LLM
     const sys = systemPrompt(process.env.RAG_SITE_NAME);
     const user = buildUserPrompt(q, lang, retrieved);
 
     const apiKey = process.env.OPENROUTER_API_KEY ?? "";
     if (!apiKey) {
       return new NextResponse(
-        JSON.stringify({
-          error:
-            "OPENROUTER_API_KEY manquant. Ajoutez-le aux variables d’environnement du projet Vercel.",
-        }),
+        JSON.stringify({ error: "OPENROUTER_API_KEY manquant (Vercel → Settings → Environment Variables)." }),
         { status: 500, headers }
       );
     }
@@ -574,7 +400,6 @@ export async function POST(req: NextRequest) {
     const { answer } = await answerWithFallback(apiKey, sys, user);
     return new NextResponse(JSON.stringify({ answer }), { status: 200, headers });
   } catch (e: unknown) {
-    console.error("[faq-ai] error:", e);
     const message = e instanceof Error ? e.message : "Unknown error";
     return new NextResponse(JSON.stringify({ error: message }), { status: 500, headers });
   }
