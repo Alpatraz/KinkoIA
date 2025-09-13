@@ -22,12 +22,13 @@ type IndexChunk = {
 };
 
 type IndexFile = { chunks: IndexChunk[] };
+
 type Retrieved = { chunk: IndexChunk; score: number };
 
-type SimpleEvent = {
-  title?: string;
-  start?: string; // ISO string
-  end?: string;   // ISO string
+type EventItem = {
+  title: string;
+  start: string; // ISO
+  end?: string;
   location?: string;
   url?: string;
   organizer?: string;
@@ -35,7 +36,7 @@ type SimpleEvent = {
 };
 
 /* =========================
-   CORS
+   CORS utils
 ========================= */
 
 function corsHeaders(req: NextRequest): Headers {
@@ -55,41 +56,7 @@ export async function OPTIONS(req: NextRequest) {
 }
 
 /* =========================
-   Utils
-========================= */
-
-function normalizeUrl(u: string): string {
-  return u.replace(/^https?:\/\/(www\.)?/i, "https://");
-}
-
-function fmtDateISO(d: string | Date): string {
-  const dt = typeof d === "string" ? new Date(d) : d;
-  if (Number.isNaN(dt.getTime())) return "";
-  return dt.toLocaleDateString("fr-FR", { day: "2-digit", month: "long", year: "numeric" });
-}
-
-function isEventQuestion(q: string): boolean {
-  const s = q.toLowerCase();
-  // Mots-clés élargis : prochaine/prochain/quand/date/inscription/réservation + compé/tournoi/événement
-  return (
-    /(prochain|prochaine|quand|date|inscription|réserv|reservation)/i.test(s) &&
-    /(comp(é|e)tition|tournoi|év(é|e)nement|event)/i.test(s)
-  );
-}
-
-function extractOrganizerFromQuestion(q: string): string | null {
-  const s = q.toLowerCase();
-  if (/(sunfuki)/i.test(s)) return "sunfuki";
-  if (/(wkc)/i.test(s)) return "wkc";
-  if (/(naska)/i.test(s)) return "naska";
-  if (/(jga\s*kenpo|kenpo)/i.test(s)) return "kenpo";
-  if (/(studios\s*unis)/i.test(s)) return "studios unis";
-  if (/(wako)/i.test(s)) return "wako";
-  return null;
-}
-
-/* =========================
-   Lecture de l'index
+   Lecture de l'index / fallback
 ========================= */
 
 let cachedIndex: IndexFile | null = null;
@@ -101,9 +68,11 @@ async function loadIndex(): Promise<IndexFile> {
   const indexPath = path.join(root, "ingested", "index.json");
   const ingestedDir = path.join(root, "ingested");
 
+  // 1) Essayer index.json
   try {
     const buf = await fs.readFile(indexPath, "utf8");
     const parsed = JSON.parse(buf) as unknown;
+
     if (
       parsed &&
       typeof parsed === "object" &&
@@ -112,10 +81,9 @@ async function loadIndex(): Promise<IndexFile> {
     ) {
       const chunks = (parsed as { chunks: unknown[] }).chunks.map((c, i) => {
         const obj = c as Record<string, unknown>;
-        const url = normalizeUrl(String(obj.url ?? ""));
         return {
           id: String(obj.id ?? i.toString()),
-          url,
+          url: String(obj.url ?? ""),
           title: obj.title ? String(obj.title) : undefined,
           text: String(obj.text ?? (obj as Record<string, unknown>).content ?? ""),
           tokens: typeof obj.tokens === "number" ? obj.tokens : undefined,
@@ -125,9 +93,10 @@ async function loadIndex(): Promise<IndexFile> {
       return cachedIndex;
     }
   } catch {
-    /* ignore */
+    // ignore
   }
 
+  // 2) Fallback: lire les .md de /ingested
   const chunks: IndexChunk[] = [];
   try {
     const files = await fs.readdir(ingestedDir);
@@ -135,13 +104,19 @@ async function loadIndex(): Promise<IndexFile> {
       if (!file.toLowerCase().endsWith(".md")) continue;
       const full = path.join(ingestedDir, file);
       const content = await fs.readFile(full, "utf8");
-      const guessedUrl = normalizeUrl(
-        "https://" + file.replaceAll("_", "/").replace(/\.md$/i, "").replace(/^https?:\/\//i, "")
-      );
-      chunks.push({ id: file, url: guessedUrl, title: file, text: content });
+      const guessedUrl = file
+        .replaceAll("_", "/")
+        .replace(/\.md$/i, "")
+        .replace(/^https?:\/\//i, "");
+      chunks.push({
+        id: file,
+        url: "https://" + guessedUrl,
+        title: file,
+        text: content,
+      });
     }
   } catch {
-    /* ignore */
+    // index vide si rien
   }
 
   cachedIndex = { chunks };
@@ -149,7 +124,7 @@ async function loadIndex(): Promise<IndexFile> {
 }
 
 /* =========================
-   Retrieval simple
+   Récupération : scoring TF-IDF-ish
 ========================= */
 
 function tokenize(s: string): string[] {
@@ -165,11 +140,17 @@ function buildIdfMap(chunks: IndexChunk[]): Map<string, number> {
   const df = new Map<string, number>();
   const N = Math.max(1, chunks.length);
   for (const ch of chunks) {
-    const seen = new Set(tokenize(ch.text));
-    for (const t of seen) df.set(t, (df.get(t) ?? 0) + 1);
+    const seen = new Set<string>();
+    for (const t of new Set(tokenize(ch.text))) {
+      if (seen.has(t)) continue;
+      seen.add(t);
+      df.set(t, (df.get(t) ?? 0) + 1);
+    }
   }
   const idf = new Map<string, number>();
-  df.forEach((v, k) => idf.set(k, Math.log((1 + N) / (1 + v)) + 1));
+  df.forEach((v, k) => {
+    idf.set(k, Math.log((1 + N) / (1 + v)) + 1);
+  });
   return idf;
 }
 
@@ -177,6 +158,7 @@ function scoreChunk(queryTokens: string[], ch: IndexChunk, idf: Map<string, numb
   if (!ch.text) return 0;
   const tokens = tokenize(ch.text);
   if (tokens.length === 0) return 0;
+
   const tf = new Map<string, number>();
   for (const t of tokens) tf.set(t, (tf.get(t) ?? 0) + 1);
 
@@ -193,6 +175,7 @@ function scoreChunk(queryTokens: string[], ch: IndexChunk, idf: Map<string, numb
     for (const qt of queryTokens) if (titleTokens.has(qt)) hits++;
     score *= 1 + Math.min(0.3, hits * 0.05);
   }
+
   return score;
 }
 
@@ -201,6 +184,7 @@ function topK(context: IndexFile, q: string, k = 6): Retrieved[] {
   if (chunks.length === 0) return [];
   const qTokens = tokenize(q).slice(0, 24);
   const idf = buildIdfMap(chunks);
+
   return chunks
     .map((ch) => ({ chunk: ch, score: scoreChunk(qTokens, ch, idf) }))
     .filter((r) => r.score > 0)
@@ -209,89 +193,169 @@ function topK(context: IndexFile, q: string, k = 6): Retrieved[] {
 }
 
 /* =========================
-   Événements temps réel via env
+   Événements en temps réel
 ========================= */
 
-function parseEventsFromEnv(): SimpleEvent[] {
-  const listStr = process.env.NEXT_EVENTS_JSON;
-  const singleStr = process.env.NEXT_EVENT_JSON;
-  const events: SimpleEvent[] = [];
-
-  try {
-    if (listStr) {
-      const arr = JSON.parse(listStr) as unknown;
-      if (Array.isArray(arr)) {
-        for (const it of arr) if (it && typeof it === "object") events.push(it as SimpleEvent);
-      }
-    }
-  } catch {}
-
-  if (!events.length && singleStr) {
+function readEventsFromEnv(): EventItem[] {
+  const plural = process.env.NEXT_EVENTS_JSON;
+  if (plural) {
     try {
-      const obj = JSON.parse(singleStr) as unknown;
-      if (obj && typeof obj === "object") events.push(obj as SimpleEvent);
-    } catch {}
+      const arr = JSON.parse(plural) as unknown;
+      if (Array.isArray(arr)) {
+        return arr
+          .map((x): EventItem | null => {
+            if (!x || typeof x !== "object") return null;
+            const o = x as Record<string, unknown>;
+            if (typeof o.title !== "string" || typeof o.start !== "string") return null;
+            return {
+              title: o.title,
+              start: o.start,
+              end: typeof o.end === "string" ? o.end : undefined,
+              location: typeof o.location === "string" ? o.location : undefined,
+              url: typeof o.url === "string" ? o.url : undefined,
+              organizer: typeof o.organizer === "string" ? o.organizer : undefined,
+              tags: Array.isArray(o.tags) ? (o.tags.filter((t) => typeof t === "string") as string[]) : undefined,
+            };
+          })
+          .filter((e): e is EventItem => !!e);
+      }
+    } catch {
+      // ignore
+    }
   }
-  return events;
+  // fallback: NEXT_EVENT_JSON (singulier)
+  const singular = process.env.NEXT_EVENT_JSON;
+  if (singular) {
+    try {
+      const o = JSON.parse(singular) as Record<string, unknown>;
+      if (o && typeof o === "object" && typeof o.title === "string" && typeof o.start === "string") {
+        return [
+          {
+            title: String(o.title),
+            start: String(o.start),
+            end: typeof o.end === "string" ? o.end : undefined,
+            location: typeof o.location === "string" ? o.location : undefined,
+            url: typeof o.url === "string" ? o.url : undefined,
+            organizer: typeof o.organizer === "string" ? o.organizer : undefined,
+            tags: Array.isArray(o.tags) ? (o.tags.filter((t) => typeof t === "string") as string[]) : undefined,
+          },
+        ];
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return [];
 }
 
-function findNextEvent(
-  events: SimpleEvent[],
-  now: Date,
-  organizerWanted?: string | null
-): SimpleEvent | null {
-  const norm = (s?: string) => (s ?? "").toLowerCase();
-  const isFuture = (iso?: string) => {
-    if (!iso) return false;
-    const d = new Date(iso);
-    return !Number.isNaN(d.getTime()) && d.getTime() >= now.getTime();
+function detectOrganizer(q: string): string | null {
+  const m = q.toLowerCase();
+  const table: Record<string, string> = {
+    "sunfuki": "sunfuki",
+    "studios unis": "studios unis",
+    "studiosunis": "studios unis",
+    "wkc": "wkc",
+    "naska": "naska",
+    "wako": "wako",
+    "jga kenpo": "jga kenpo",
+    "jgakenpo": "jga kenpo",
   };
-
-  let pool = events.filter((e) => isFuture(e.start));
-
-  if (organizerWanted) {
-    const wanted = organizerWanted.toLowerCase();
-    pool = pool.filter((e) => {
-      const org = norm(e.organizer);
-      const hasTag = Array.isArray(e.tags) && e.tags.some((t) => norm(t) === wanted);
-      const inTitle = norm(e.title).includes(wanted);
-      return org.includes(wanted) || hasTag || inTitle;
-    });
+  for (const k of Object.keys(table)) {
+    if (m.includes(k)) return table[k];
   }
-
-  if (!pool.length) return null;
-  pool.sort((a, b) => new Date(a.start ?? 0).getTime() - new Date(b.start ?? 0).getTime());
-  return pool[0] ?? null;
+  return null;
 }
 
-function chunkFromEvent(ev: SimpleEvent, label?: string): IndexChunk {
-  const title = ev.title ?? label ?? "Prochaine compétition";
-  const dateStart = ev.start ? fmtDateISO(ev.start) : "";
-  const dateEnd = ev.end ? fmtDateISO(ev.end) : "";
-  const when =
-    dateStart && dateEnd && dateStart !== dateEnd
-      ? `${dateStart} → ${dateEnd}`
-      : dateStart || dateEnd || "(date à confirmer)";
-  const where = ev.location ? ` — Lieu : ${ev.location}` : "";
-  const org = ev.organizer ? ` — Organisateur : ${ev.organizer}` : "";
-  const url = ev.url ? normalizeUrl(ev.url) : "https://qfxdmn-i3.myshopify.com/pages/calendrier";
+function normalizeUrl(u: string): string {
+  try {
+    const x = new URL(u);
+    x.hostname = x.hostname.replace(/^www\./, "");
+    return x.toString();
+  } catch {
+    return u.replace("://www.", "://");
+  }
+}
 
-  const textLines = [
-    `${label ?? "Prochaine compétition"} : ${title}`,
-    `Date : ${when}${where}${org}`,
-    `Lien d'information / inscription : ${url}`,
-  ];
+function pickNextEvent(events: EventItem[], org?: string | null): EventItem | null {
+  const now = Date.now();
+  const list = events.filter((e) => {
+    const t = Date.parse(e.start);
+    if (Number.isNaN(t) || t < now) return false;
+    if (!org) return true;
+    const orga = (e.organizer ?? "").toLowerCase();
+    const tags = (e.tags ?? []).map((x) => x.toLowerCase());
+    return orga.includes(org) || tags.includes(org);
+  });
+  if (list.length === 0) return null;
+  list.sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
+  return list[0];
+}
 
-  return {
-    id: `event_${(ev.title ?? "next").replace(/\s+/g, "_")}`,
-    url,
-    title: label ?? "Prochaine compétition",
-    text: textLines.join("\n"),
-  };
+function formatEventLine(e: EventItem): string {
+  const d = new Date(e.start);
+  const date = d.toLocaleDateString("fr-CA", { year: "numeric", month: "long", day: "numeric" });
+  const parts = [
+    `**${e.title}** — ${date}`,
+    e.location ? `à ${e.location}` : null,
+    e.organizer ? `(organisateur : ${e.organizer})` : null,
+  ].filter(Boolean);
+  const head = parts.join(" ");
+  const link = e.url ? `\n→ [Calendrier des compétitions](${normalizeUrl(e.url)})` : "";
+  return head + link;
 }
 
 /* =========================
-   Modèles OpenRouter
+   Résultats passés (JSON)
+========================= */
+
+async function loadResultsChunks(): Promise<IndexChunk[]> {
+  const root = process.cwd();
+  const dir = path.join(root, "public", "results");
+  const out: IndexChunk[] = [];
+  try {
+    const files = await fs.readdir(dir);
+    for (const f of files) {
+      if (!f.toLowerCase().endsWith(".json")) continue;
+      const full = path.join(dir, f);
+      const raw = await fs.readFile(full, "utf8");
+      // Résumé "safe" pour retrieval
+      let title = f.replace(/\.json$/i, "");
+      let url = `${process.env.SHOPIFY_PUBLIC_BASE ?? "https://qfxdmn-i3.myshopify.com"}/results/${encodeURIComponent(f)}`;
+      let summary = raw.slice(0, 2000);
+      try {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        const t = parsed["title"];
+        const date = parsed["date"] ?? parsed["when"];
+        const org = parsed["organizer"];
+        const loc = parsed["location"] ?? parsed["city"];
+        const head = [
+          typeof t === "string" ? t : null,
+          typeof date === "string" ? date : null,
+          typeof org === "string" ? `(${org})` : null,
+          typeof loc === "string" ? `— ${loc}` : null,
+        ]
+          .filter(Boolean)
+          .join(" ");
+        if (head) title = head;
+        summary = JSON.stringify(parsed).slice(0, 2000);
+      } catch {
+        // garde le raw slice
+      }
+      out.push({
+        id: `result:${f}`,
+        url,
+        title,
+        text: summary,
+      });
+    }
+  } catch {
+    // aucun fichier => ok
+  }
+  return out;
+}
+
+/* =========================
+   Prompt & appel OpenRouter
 ========================= */
 
 const DEFAULT_MODEL_LIST =
@@ -310,51 +374,51 @@ const MODEL_LIST: string[] = process.env.RAG_MODEL
 
 const DEFAULT_MODEL: string = MODEL_LIST[0] ?? "google/gemma-2-9b-it:free";
 
-/* =========================
-   Prompt & OpenRouter
-========================= */
-
-function systemPrompt(siteName?: string): string {
+function systemPrompt(siteName: string | undefined): string {
   const tag = siteName ? ` pour ${siteName}` : "";
   return [
     `Tu es “Sempaï Kinko”, un assistant d’aide et de vente${tag}.`,
-    `Parle clairement et utilement.`,
-    `Si l’info n’est pas dans le contexte, dis-le et propose une alternative concrète (page, contact, etc.).`,
-    `Quand tu cites des pages, mets des liens HTML cliquables (<a href="...">texte</a>).`,
+    `Objectif : répondre clairement, brièvement, et utilement.`,
+    `Règles :`,
+    `- Langue : réponds dans la langue demandée (fr par défaut si non précisé).`,
+    `- Si la réponse n'est pas dans le contexte, dis-le simplement et propose d'aider à la trouver (pas d'invention).`,
+    `- Oriente vers l’achat/inscription/contact si pertinent.`,
+    `- Fournis 1–3 sources maxi. Ne montre PAS d’URL brute : formate les liens en Markdown [texte](url).`,
   ].join("\n");
 }
 
-function buildUserPrompt(q: string, lang: string | undefined, retrieved: Retrieved[]): string {
-  const ctx = retrieved
+function buildUserPrompt(
+  q: string,
+  lang: string | undefined,
+  retrieved: Retrieved[],
+  realtimeNotes: string[]
+): string {
+  const ctxRag = retrieved
     .map((r, i) => {
       const head = r.chunk.title ? `${r.chunk.title} — ${r.chunk.url}` : r.chunk.url;
-      const body = r.chunk.text.slice(0, 3500);
-      return `[#${i + 1}] ${head}\n${body}`;
+      const body = r.chunk.text.slice(0, 4000);
+      return `[#RAG-${i + 1}] ${head}\n${body}`;
     })
     .join("\n\n---\n\n");
 
-  const dedup = Array.from(new Set(retrieved.map((r) => r.chunk.url))).slice(0, 3);
-  const sourcesHtml = dedup
-    .map((u) => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`)
-    .join("\n- ");
+  const ctxRealtime = realtimeNotes.length
+    ? `[#REALTIME]\n${realtimeNotes.join("\n")}`
+    : "";
 
   return [
     `Question: ${q}`,
-    `Langue attendue: ${lang || "fr"}`,
+    lang ? `Langue attendue: ${lang}` : `Langue attendue: fr`,
     ``,
-    `Contexte (extraits) :`,
-    ctx || "(aucun extrait pertinent trouvé)",
+    `Contexte (extraits provenant du site et données temps réel) :`,
+    ctxRealtime,
+    ctxRag || "(aucun extrait pertinent trouvé)",
     ``,
     `Consignes de réponse :`,
     `- Réponds directement, sans méta-commentaires.`,
-    `- Termine par un bloc "Sources :" listant 1–3 liens pertinents (HTML <a>) tirés du contexte.`,
-    `Sources (pré-sélection) :`,
-    sourcesHtml ? `- ${sourcesHtml}` : `- (Aucune source disponible)`,
+    `- Si l'info n'est pas dans le contexte, dis-le et propose une alternative concrète (page à visiter, contact…).`,
+    `- Termine par une section "Sources" (1–3 liens) en Markdown [texte](url), sans afficher l’URL brute.`,
   ].join("\n");
 }
-
-type ORChoice = { message: { role: "assistant"; content: string } };
-type ORResp = { choices?: ORChoice[] };
 
 async function callOpenRouterChat(
   apiKey: string,
@@ -385,7 +449,10 @@ async function callOpenRouterChat(
     throw new Error(`OpenRouter error ${res.status}: ${text}`);
   }
 
-  const json = (await res.json()) as ORResp;
+  type Choice = { message: { role: "assistant"; content: string } };
+  type ORResponse = { choices: Choice[] };
+
+  const json = (await res.json()) as ORResponse;
   const content = json.choices?.[0]?.message?.content?.trim();
   if (!content) throw new Error("Réponse vide du modèle.");
   return content;
@@ -414,7 +481,45 @@ async function answerWithFallback(
 }
 
 /* =========================
-   POST (+ mode debug __events__)
+   Post-traitement de liens
+========================= */
+
+function labelForUrl(u: string): string {
+  try {
+    const x = new URL(u);
+    const p = x.pathname;
+    if (p.includes("/pages/calendrier")) return "Calendrier des compétitions";
+    if (p.includes("/blogs/")) return "Article du blog";
+    if (p.includes("/products/")) return "Voir le produit";
+    if (p.includes("/pages/")) return "Voir la page";
+    return x.hostname.replace(/^www\./, "");
+  } catch {
+    return "Lien";
+  }
+}
+
+function tidyLinks(markdown: string): string {
+  // 1) supprime www. dans les href
+  let txt = markdown.replace(/\((https?:\/\/)www\./g, "($1");
+
+  // 2) Si le texte du lien est l’URL brute, remplace par un libellé
+  //    pattern: [https://domaine/...](https://domaine/...)
+  txt = txt.replace(
+    /\[https?:\/\/[^\]]+\]\((https?:\/\/[^\)]+)\)/g,
+    (_m, href: string) => `[${labelForUrl(href)}](${normalizeUrl(href)})`
+  );
+
+  // 3) Sur les liens déjà corrects, normalise juste le href (sans www)
+  txt = txt.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g,
+    (_m, label: string, href: string) => `[${label} ](${normalizeUrl(href)})`
+  );
+
+  return txt;
+}
+
+/* =========================
+   Handler POST
 ========================= */
 
 export async function POST(req: NextRequest) {
@@ -422,7 +527,19 @@ export async function POST(req: NextRequest) {
 
   try {
     const body = (await req.json()) as unknown;
-    const { q, lang } = (body as FaqAiRequest) ?? {};
+    const { q, lang } = (body ?? {}) as FaqAiRequest;
+
+    // endpoint debug interne
+    if (q === "__events__") {
+      const events = readEventsFromEnv();
+      const next = pickNextEvent(events, null);
+      const nextSunfuki = pickNextEvent(events, "sunfuki");
+      return new NextResponse(
+        JSON.stringify({ count: events.length, next, nextSunfuki }),
+        { status: 200, headers }
+      );
+    }
+
     if (!q || typeof q !== "string") {
       return new NextResponse(JSON.stringify({ error: "Paramètre 'q' manquant." }), {
         status: 400,
@@ -430,46 +547,57 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // --- DEBUG : renvoie les événements vus par l’API
-    if (q.trim() === "__events__") {
-      const events = parseEventsFromEnv();
-      const generic = findNextEvent(events, new Date(), null);
-      const sunfuki = findNextEvent(events, new Date(), "sunfuki");
-      return new NextResponse(
-        JSON.stringify({ count: events.length, next: generic, nextSunfuki: sunfuki }),
-        { status: 200, headers }
-      );
+    // 1) RAG
+    const index = await loadIndex();
+    const retrieved = topK(index, q, 6);
+
+    // 2) Données temps réel (événements)
+    const realtimeNotes: string[] = [];
+    const org = detectOrganizer(q);
+    const events = readEventsFromEnv();
+
+    // prochaine globale
+    const nextEvent = pickNextEvent(events, null);
+    if (nextEvent) {
+      realtimeNotes.push(`Prochaine compétition (tous organisateurs) :\n${formatEventLine(nextEvent)}`);
     }
 
-    const index = await loadIndex();
-    let retrieved = topK(index, q, 6);
-
-    // Injection temps réel si question événementielle
-    if (isEventQuestion(q)) {
-      const organizer = extractOrganizerFromQuestion(q);
-      const events = parseEventsFromEnv();
-      const candidate = findNextEvent(events, new Date(), organizer);
-      if (candidate) {
-        const label = organizer ? `Prochaine compétition ${organizer}` : "Prochaine compétition";
-        const chunk = chunkFromEvent(candidate, label);
-        retrieved = [{ chunk, score: 999 }, ...retrieved];
+    // prochaine par organisateur si demandé
+    if (org) {
+      const nextOrg = pickNextEvent(events, org);
+      if (nextOrg) {
+        realtimeNotes.push(`Prochaine compétition **${org}** :\n${formatEventLine(nextOrg)}`);
       }
     }
 
+    // 3) Résultats passés (JSON) → injectés comme pseudo-chunks
+    const pastChunks = await loadResultsChunks();
+    const retrievedPlusPast: Retrieved[] = [
+      ...retrieved,
+      ...pastChunks.map((c, i) => ({ chunk: c, score: 0.5 - i * 0.01 })), // un petit poids fixe
+    ];
+
+    // 4) Prompt + appel modèle
     const sys = systemPrompt(process.env.RAG_SITE_NAME);
-    const user = buildUserPrompt(q, lang, retrieved);
+    const user = buildUserPrompt(q, lang, retrievedPlusPast, realtimeNotes);
 
     const apiKey = process.env.OPENROUTER_API_KEY ?? "";
     if (!apiKey) {
       return new NextResponse(
-        JSON.stringify({ error: "OPENROUTER_API_KEY manquant (Vercel → Settings → Environment Variables)." }),
+        JSON.stringify({
+          error:
+            "OPENROUTER_API_KEY manquant. Ajoutez-le aux variables d’environnement Vercel.",
+        }),
         { status: 500, headers }
       );
     }
 
     const { answer } = await answerWithFallback(apiKey, sys, user);
-    return new NextResponse(JSON.stringify({ answer }), { status: 200, headers });
+    const pretty = tidyLinks(answer);
+
+    return new NextResponse(JSON.stringify({ answer: pretty }), { status: 200, headers });
   } catch (e: unknown) {
+    console.error("[faq-ai] error:", e);
     const message = e instanceof Error ? e.message : "Unknown error";
     return new NextResponse(JSON.stringify({ error: message }), { status: 500, headers });
   }
