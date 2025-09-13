@@ -22,8 +22,17 @@ type IndexChunk = {
 };
 
 type IndexFile = { chunks: IndexChunk[] };
-
 type Retrieved = { chunk: IndexChunk; score: number };
+
+type SimpleEvent = {
+  title?: string;
+  start?: string;
+  end?: string;
+  location?: string;
+  url?: string;
+  organizer?: string;
+  tags?: string[];
+};
 
 /* =========================
    CORS
@@ -50,6 +59,7 @@ export async function OPTIONS(req: NextRequest) {
 ========================= */
 
 function normalizeUrl(u: string): string {
+  // enlève "www." et normalise le schéma
   return u.replace(/^https?:\/\/(www\.)?/i, "https://");
 }
 
@@ -61,8 +71,18 @@ function fmtDateISO(d: string | Date): string {
 
 function isEventQuestion(q: string): boolean {
   const s = q.toLowerCase();
-  return /(prochain|prochaine|date|quand).*(comp(é|e)tition|tournoi|év(é|e)nement|event)/i.test(s) ||
-         /(comp(é|e)tition|tournoi|év(é|e)nement|event).*(prochain|prochaine|date|quand)/i.test(s);
+  return /(prochain|prochaine|date|quand).*(comp(é|e)tition|tournoi|év(é|e)nement|event)/i.test(s)
+      || /(comp(é|e)tition|tournoi|év(é|e)nement|event).*(prochain|prochaine|date|quand)/i.test(s);
+}
+
+function extractOrganizerFromQuestion(q: string): string | null {
+  const s = q.toLowerCase();
+  // Ajoute ici d’autres organisateurs si besoin
+  if (/(sunfuki)/i.test(s)) return "sunfuki";
+  if (/(wkc)/i.test(s)) return "wkc";
+  if (/(naska)/i.test(s)) return "naska";
+  if (/(jga\s*kenpo|kenpo)/i.test(s)) return "kenpo";
+  return null;
 }
 
 /* =========================
@@ -103,7 +123,7 @@ async function loadIndex(): Promise<IndexFile> {
       return cachedIndex;
     }
   } catch {
-    /* pass */
+    /* ignore */
   }
 
   // 2) fallback .md
@@ -115,13 +135,12 @@ async function loadIndex(): Promise<IndexFile> {
       const full = path.join(ingestedDir, file);
       const content = await fs.readFile(full, "utf8");
       const guessedUrl = normalizeUrl(
-        "https://" +
-          file.replaceAll("_", "/").replace(/\.md$/i, "").replace(/^https?:\/\//i, "")
+        "https://" + file.replaceAll("_", "/").replace(/\.md$/i, "").replace(/^https?:\/\//i, "")
       );
       chunks.push({ id: file, url: guessedUrl, title: file, text: content });
     }
   } catch {
-    /* pass */
+    /* ignore */
   }
 
   cachedIndex = { chunks };
@@ -190,53 +209,95 @@ function topK(context: IndexFile, q: string, k = 6): Retrieved[] {
 }
 
 /* =========================
-   Chunk "prochaine compétition" (temps réel via env)
+   Événements temps réel (depuis env)
 ========================= */
 
-function nextEventChunkFromEnv(): IndexChunk | null {
-  const v = process.env.NEXT_EVENT_JSON;
-  if (!v) return null;
+function parseEventsFromEnv(): SimpleEvent[] {
+  const listStr = process.env.NEXT_EVENTS_JSON;
+  const singleStr = process.env.NEXT_EVENT_JSON;
+  const events: SimpleEvent[] = [];
+
   try {
-    const parsed = JSON.parse(v) as {
-      title?: string;
-      start?: string;
-      end?: string;
-      location?: string;
-      url?: string;
-      organizer?: string;
-    };
-
-    const title = parsed.title ?? "Prochaine compétition";
-    const dateStr = parsed.start ? fmtDateISO(parsed.start) : "";
-    const endStr = parsed.end ? fmtDateISO(parsed.end) : "";
-    const where = parsed.location ? ` — Lieu : ${parsed.location}` : "";
-    const org = parsed.organizer ? ` — Organisateur : ${parsed.organizer}` : "";
-    const url = parsed.url ? normalizeUrl(parsed.url) : "";
-
-    const when =
-      dateStr && endStr && dateStr !== endStr
-        ? `${dateStr} → ${endStr}`
-        : dateStr || endStr || "(date à confirmer)";
-
-    const textLines = [
-      `Prochaine compétition : ${title}`,
-      `Date : ${when}${where}${org}`,
-      url ? `Lien d'information / inscription : ${url}` : ``,
-    ].filter(Boolean);
-
-    return {
-      id: "next_event",
-      url: url || "https://qfxdmn-i3.myshopify.com/pages/calendrier",
-      title: "Prochaine compétition",
-      text: textLines.join("\n"),
-    };
+    if (listStr) {
+      const arr = JSON.parse(listStr) as unknown;
+      if (Array.isArray(arr)) {
+        for (const it of arr) {
+          if (it && typeof it === "object") events.push(it as SimpleEvent);
+        }
+      }
+    }
   } catch {
-    return null;
+    /* ignore */
   }
+
+  if (!events.length && singleStr) {
+    try {
+      const obj = JSON.parse(singleStr) as unknown;
+      if (obj && typeof obj === "object") events.push(obj as SimpleEvent);
+    } catch {
+      /* ignore */
+    }
+  }
+  return events;
+}
+
+function findNextEvent(
+  events: SimpleEvent[],
+  now: Date,
+  organizerWanted?: string | null
+): SimpleEvent | null {
+  const norm = (s?: string) => (s ?? "").toLowerCase();
+  const isFuture = (iso?: string) => {
+    if (!iso) return false;
+    const d = new Date(iso);
+    return !Number.isNaN(d.getTime()) && d.getTime() >= now.getTime();
+  };
+
+  let pool = events.filter((e) => isFuture(e.start));
+
+  if (organizerWanted) {
+    const wanted = organizerWanted.toLowerCase();
+    pool = pool.filter((e) => {
+      const org = norm(e.organizer);
+      const hasTag = Array.isArray(e.tags) && e.tags.some((t) => norm(t) === wanted);
+      return org.includes(wanted) || hasTag;
+    });
+  }
+
+  if (!pool.length) return null;
+
+  pool.sort((a, b) => new Date(a.start ?? 0).getTime() - new Date(b.start ?? 0).getTime());
+  return pool[0] ?? null;
+}
+
+function chunkFromEvent(ev: SimpleEvent, label?: string): IndexChunk {
+  const title = ev.title ?? label ?? "Prochaine compétition";
+  const dateStart = ev.start ? fmtDateISO(ev.start) : "";
+  const dateEnd = ev.end ? fmtDateISO(ev.end) : "";
+  const when =
+    dateStart && dateEnd && dateStart !== dateEnd
+      ? `${dateStart} → ${dateEnd}`
+      : dateStart || dateEnd || "(date à confirmer)";
+  const where = ev.location ? ` — Lieu : ${ev.location}` : "";
+  const org = ev.organizer ? ` — Organisateur : ${ev.organizer}` : "";
+  const url = ev.url ? normalizeUrl(ev.url) : "https://qfxdmn-i3.myshopify.com/pages/calendrier";
+
+  const textLines = [
+    `${label ?? "Prochaine compétition"} : ${title}`,
+    `Date : ${when}${where}${org}`,
+    `Lien d'information / inscription : ${url}`,
+  ];
+
+  return {
+    id: `event_${(ev.title ?? "next").replace(/\s+/g, "_")}`,
+    url,
+    title: label ?? "Prochaine compétition",
+    text: textLines.join("\n"),
+  };
 }
 
 /* =========================
-   Modèles OpenRouter (fallback)
+   Modèles OpenRouter
 ========================= */
 
 const DEFAULT_MODEL_LIST =
@@ -378,11 +439,16 @@ export async function POST(req: NextRequest) {
     const index = await loadIndex();
     let retrieved = topK(index, q, 6);
 
-    // 🔸 Injection temps réel "prochaine compétition"
+    // 🔸 Injection temps réel (filtrée sur l’organisateur si présent)
     if (isEventQuestion(q)) {
-      const nextEvt = nextEventChunkFromEnv();
-      if (nextEvt) {
-        retrieved = [{ chunk: nextEvt, score: 999 }, ...retrieved];
+      const organizer = extractOrganizerFromQuestion(q); // ex. "sunfuki"
+      const events = parseEventsFromEnv();
+      const candidate = findNextEvent(events, new Date(), organizer);
+      if (candidate) {
+        const label = organizer ? `Prochaine compétition ${organizer}` : "Prochaine compétition";
+        const chunk = chunkFromEvent(candidate, label);
+        // score élevé pour que ce chunk remonte, mais seulement s'il y a un match
+        retrieved = [{ chunk, score: 999 }, ...retrieved];
       }
     }
 
