@@ -26,8 +26,8 @@ type Retrieved = { chunk: IndexChunk; score: number };
 
 type SimpleEvent = {
   title?: string;
-  start?: string;
-  end?: string;
+  start?: string; // ISO string
+  end?: string;   // ISO string
   location?: string;
   url?: string;
   organizer?: string;
@@ -59,7 +59,6 @@ export async function OPTIONS(req: NextRequest) {
 ========================= */
 
 function normalizeUrl(u: string): string {
-  // enlève "www." et normalise le schéma
   return u.replace(/^https?:\/\/(www\.)?/i, "https://");
 }
 
@@ -71,17 +70,21 @@ function fmtDateISO(d: string | Date): string {
 
 function isEventQuestion(q: string): boolean {
   const s = q.toLowerCase();
-  return /(prochain|prochaine|date|quand).*(comp(é|e)tition|tournoi|év(é|e)nement|event)/i.test(s)
-      || /(comp(é|e)tition|tournoi|év(é|e)nement|event).*(prochain|prochaine|date|quand)/i.test(s);
+  // Mots-clés élargis : prochaine/prochain/quand/date/inscription/réservation + compé/tournoi/événement
+  return (
+    /(prochain|prochaine|quand|date|inscription|réserv|reservation)/i.test(s) &&
+    /(comp(é|e)tition|tournoi|év(é|e)nement|event)/i.test(s)
+  );
 }
 
 function extractOrganizerFromQuestion(q: string): string | null {
   const s = q.toLowerCase();
-  // Ajoute ici d’autres organisateurs si besoin
   if (/(sunfuki)/i.test(s)) return "sunfuki";
   if (/(wkc)/i.test(s)) return "wkc";
   if (/(naska)/i.test(s)) return "naska";
   if (/(jga\s*kenpo|kenpo)/i.test(s)) return "kenpo";
+  if (/(studios\s*unis)/i.test(s)) return "studios unis";
+  if (/(wako)/i.test(s)) return "wako";
   return null;
 }
 
@@ -98,7 +101,6 @@ async function loadIndex(): Promise<IndexFile> {
   const indexPath = path.join(root, "ingested", "index.json");
   const ingestedDir = path.join(root, "ingested");
 
-  // 1) index.json
   try {
     const buf = await fs.readFile(indexPath, "utf8");
     const parsed = JSON.parse(buf) as unknown;
@@ -126,7 +128,6 @@ async function loadIndex(): Promise<IndexFile> {
     /* ignore */
   }
 
-  // 2) fallback .md
   const chunks: IndexChunk[] = [];
   try {
     const files = await fs.readdir(ingestedDir);
@@ -148,7 +149,7 @@ async function loadIndex(): Promise<IndexFile> {
 }
 
 /* =========================
-   Retrieval (TF-IDF simple)
+   Retrieval simple
 ========================= */
 
 function tokenize(s: string): string[] {
@@ -176,7 +177,6 @@ function scoreChunk(queryTokens: string[], ch: IndexChunk, idf: Map<string, numb
   if (!ch.text) return 0;
   const tokens = tokenize(ch.text);
   if (tokens.length === 0) return 0;
-
   const tf = new Map<string, number>();
   for (const t of tokens) tf.set(t, (tf.get(t) ?? 0) + 1);
 
@@ -209,7 +209,7 @@ function topK(context: IndexFile, q: string, k = 6): Retrieved[] {
 }
 
 /* =========================
-   Événements temps réel (depuis env)
+   Événements temps réel via env
 ========================= */
 
 function parseEventsFromEnv(): SimpleEvent[] {
@@ -221,22 +221,16 @@ function parseEventsFromEnv(): SimpleEvent[] {
     if (listStr) {
       const arr = JSON.parse(listStr) as unknown;
       if (Array.isArray(arr)) {
-        for (const it of arr) {
-          if (it && typeof it === "object") events.push(it as SimpleEvent);
-        }
+        for (const it of arr) if (it && typeof it === "object") events.push(it as SimpleEvent);
       }
     }
-  } catch {
-    /* ignore */
-  }
+  } catch {}
 
   if (!events.length && singleStr) {
     try {
       const obj = JSON.parse(singleStr) as unknown;
       if (obj && typeof obj === "object") events.push(obj as SimpleEvent);
-    } catch {
-      /* ignore */
-    }
+    } catch {}
   }
   return events;
 }
@@ -260,12 +254,12 @@ function findNextEvent(
     pool = pool.filter((e) => {
       const org = norm(e.organizer);
       const hasTag = Array.isArray(e.tags) && e.tags.some((t) => norm(t) === wanted);
-      return org.includes(wanted) || hasTag;
+      const inTitle = norm(e.title).includes(wanted);
+      return org.includes(wanted) || hasTag || inTitle;
     });
   }
 
   if (!pool.length) return null;
-
   pool.sort((a, b) => new Date(a.start ?? 0).getTime() - new Date(b.start ?? 0).getTime());
   return pool[0] ?? null;
 }
@@ -420,7 +414,7 @@ async function answerWithFallback(
 }
 
 /* =========================
-   POST
+   POST (+ mode debug __events__)
 ========================= */
 
 export async function POST(req: NextRequest) {
@@ -436,18 +430,28 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    // --- DEBUG : renvoie les événements vus par l’API
+    if (q.trim() === "__events__") {
+      const events = parseEventsFromEnv();
+      const generic = findNextEvent(events, new Date(), null);
+      const sunfuki = findNextEvent(events, new Date(), "sunfuki");
+      return new NextResponse(
+        JSON.stringify({ count: events.length, next: generic, nextSunfuki: sunfuki }),
+        { status: 200, headers }
+      );
+    }
+
     const index = await loadIndex();
     let retrieved = topK(index, q, 6);
 
-    // 🔸 Injection temps réel (filtrée sur l’organisateur si présent)
+    // Injection temps réel si question événementielle
     if (isEventQuestion(q)) {
-      const organizer = extractOrganizerFromQuestion(q); // ex. "sunfuki"
+      const organizer = extractOrganizerFromQuestion(q);
       const events = parseEventsFromEnv();
       const candidate = findNextEvent(events, new Date(), organizer);
       if (candidate) {
         const label = organizer ? `Prochaine compétition ${organizer}` : "Prochaine compétition";
         const chunk = chunkFromEvent(candidate, label);
-        // score élevé pour que ce chunk remonte, mais seulement s'il y a un match
         retrieved = [{ chunk, score: 999 }, ...retrieved];
       }
     }
