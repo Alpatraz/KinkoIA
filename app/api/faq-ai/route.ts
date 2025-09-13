@@ -3,7 +3,6 @@ import { NextRequest, NextResponse } from "next/server";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-/** Next runtime hints */
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -18,7 +17,7 @@ type IndexChunk = {
   id: string;
   url: string;
   title?: string;
-  text: string;
+  text: string; // contenu brut du chunk
   tokens?: number;
 };
 
@@ -31,36 +30,12 @@ type Retrieved = {
   score: number;
 };
 
-/** Shopify Admin GraphQL types (partiels, suffisants ici) */
-type MetaobjectField = { key: string; value: string };
-type MetaobjectNode = {
-  id: string;
-  type: string;
-  handle?: string | null;
-  fields: MetaobjectField[];
-};
-type MetaobjectsResponse = {
-  data?: {
-    metaobjects: { edges: { node: MetaobjectNode }[] };
-  };
-  errors?: unknown;
-};
-
-type ArticlesResponse = {
-  data?: {
-    articles: {
-      edges: {
-        node: {
-          id: string;
-          title: string;
-          onlineStoreUrl?: string | null;
-          publishedAt?: string | null;
-          blog: { handle: string };
-        };
-      }[];
-    };
-  };
-  errors?: unknown;
+type EventItem = {
+  title?: string;
+  start?: string; // ISO date
+  end?: string;   // ISO date
+  location?: string;
+  url?: string;
 };
 
 /* =========================
@@ -84,6 +59,33 @@ export async function OPTIONS(req: NextRequest) {
 }
 
 /* =========================
+   Helpers URLs + Markdown→HTML
+========================= */
+
+function publicBase(): string {
+  const raw = process.env.SHOPIFY_PUBLIC_BASE?.trim() || "";
+  if (!raw) return "";
+  // retire www. et slash final
+  let s = raw.replace(/^https?:\/\/www\./i, "https://").replace(/\/+$/, "");
+  if (!/^https?:\/\//i.test(s)) s = "https://" + s;
+  return s;
+}
+
+function autoLinkMarkdown(s: string): string {
+  // [label](url) -> <a href="url">label</a>
+  const withMd = s.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    (_m, label, url) =>
+      `<a href="${url}" target="_blank" rel="noopener">${label}</a>`
+  );
+  // liens bruts -> <a>
+  return withMd.replace(
+    /(https?:\/\/[^\s)]+)(?![^<]*>)/g,
+    (m) => `<a href="${m}" target="_blank" rel="noopener">${m}</a>`
+  );
+}
+
+/* =========================
    Lecture de l'index / fallback
 ========================= */
 
@@ -96,7 +98,7 @@ async function loadIndex(): Promise<IndexFile> {
   const indexPath = path.join(root, "ingested", "index.json");
   const ingestedDir = path.join(root, "ingested");
 
-  // 1) Essayer index.json (format { chunks: [...] })
+  // 1) Essayer index.json
   try {
     const buf = await fs.readFile(indexPath, "utf8");
     const parsed = JSON.parse(buf) as unknown;
@@ -152,7 +154,7 @@ async function loadIndex(): Promise<IndexFile> {
 }
 
 /* =========================
-   Récupération : TF-IDF simple
+   Récupération : scoring simple TF-IDF-ish
 ========================= */
 
 function tokenize(s: string): string[] {
@@ -226,7 +228,7 @@ function topK(context: IndexFile, q: string, k = 6): Retrieved[] {
 }
 
 /* =========================
-   OpenRouter – modèles & appels
+   OpenRouter (fallback multi-modèles)
 ========================= */
 
 const DEFAULT_MODEL_LIST =
@@ -297,6 +299,7 @@ async function callOpenRouterChat(
       "Content-Type": "application/json",
       "HTTP-Referer": process.env.OPENROUTER_SITE_URL ?? "https://example.com",
       "X-Title": process.env.OPENROUTER_SITE_NAME ?? "Kinko FAQ AI",
+      "Cache-Control": "no-store",
     },
     body: JSON.stringify({
       model,
@@ -313,9 +316,10 @@ async function callOpenRouterChat(
     throw new Error(`OpenRouter error ${res.status}: ${text}`);
   }
 
-  const json = (await res.json()) as {
-    choices?: { message?: { role?: string; content?: string } }[];
-  };
+  type Choice = { message: { role: "assistant"; content: string } };
+  type ORResponse = { choices: Choice[] };
+
+  const json = (await res.json()) as ORResponse;
   const content = json.choices?.[0]?.message?.content?.trim();
   if (!content) throw new Error("Réponse vide du modèle.");
   return content;
@@ -344,182 +348,126 @@ async function answerWithFallback(
 }
 
 /* =========================
-   Shopify Admin – helpers temps réel
+   TEMPS RÉEL : metaobjects "event" (prochaine compétition)
 ========================= */
 
-function hasShopifyAdmin(): boolean {
-  return Boolean(process.env.SHOPIFY_SHOP && process.env.SHOPIFY_ADMIN_TOKEN);
-}
-
-/** Appel générique Admin GraphQL */
-async function adminGraphQL<T = unknown>(
-  query: string,
-  variables?: Record<string, unknown>
-): Promise<T> {
-  const shop = process.env.SHOPIFY_SHOP!;
-  const token = process.env.SHOPIFY_ADMIN_TOKEN!;
-  const apiVersion = process.env.SHOPIFY_API_VERSION ?? "2024-10";
-  const endpoint = `https://${shop}/admin/api/${apiVersion}/graphql.json`;
-
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "X-Shopify-Access-Token": token,
-      "Content-Type": "application/json",
-    },
-    cache: "no-store",
-    body: JSON.stringify({ query, variables }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Shopify Admin GraphQL ${res.status}: ${text}`);
+function shopDomainFromBase(): string | null {
+  const base = publicBase();
+  if (!base) return null;
+  try {
+    const u = new URL(base);
+    return u.hostname; // ex: qfxdmn-i3.myshopify.com
+  } catch {
+    return null;
   }
-
-  const json = (await res.json()) as T;
-  return json;
 }
 
-/** Parse une date ISO (ou proche) en Date, sans throw */
-function parseDateMaybe(s: string | undefined): Date | null {
-  if (!s) return null;
-  const d = new Date(s);
-  return Number.isNaN(d.getTime()) ? null : d;
+// Tente de repérer les clés probables dans tes metaobjects
+function parseEventFields(fields: Array<{ key: string; value: string }>): EventItem {
+  const map: Record<string, string> = {};
+  for (const f of fields) map[f.key.toLowerCase()] = f.value;
+
+  const title =
+    map["title"] || map["name"] || map["nom"] || map["event"] || map["evenement"];
+  const start =
+    map["start"] || map["date"] || map["start_date"] || map["date_debut"] || map["debut"];
+  const end =
+    map["end"] || map["end_date"] || map["date_fin"] || map["fin"];
+  const location = map["location"] || map["lieu"] || map["city"] || map["ville"];
+  const url = map["url"] || map["register_url"] || map["inscription"] || map["lien"];
+
+  return { title, start, end, location, url };
 }
 
-/** Récupère la prochaine compétition via metaobjects Admin */
-async function fetchNextEventChunk(): Promise<IndexChunk | null> {
-  if (!hasShopifyAdmin()) return null;
+async function fetchNextEvent(): Promise<EventItem | null> {
+  const shopHost = shopDomainFromBase();
+  const token = process.env.SHOPIFY_ADMIN_TOKEN;
+  if (!shopHost || !token) return null;
 
-  const typeHandle = process.env.SHOPIFY_EVENT_METAOBJECT ?? "event";
-  const dateKey = process.env.SHOPIFY_EVENT_DATE_FIELD ?? "date";
-  const titleKey = process.env.SHOPIFY_EVENT_TITLE_FIELD ?? "title";
-  const urlKey = process.env.SHOPIFY_EVENT_URL_FIELD ?? "url";
-  const locKey = process.env.SHOPIFY_EVENT_LOCATION_FIELD ?? "location";
-  const calendarPath = process.env.SHOPIFY_CALENDAR_URL ?? "/pages/calendrier";
+  const apiVersion = "2024-10";
+  const endpoint = `https://${shopHost}/admin/api/${apiVersion}/graphql.json`;
 
-  const q = `
-    query NextEvents($type: String!, $first: Int!) {
+  const query = `
+    query Events($type: String!, $first: Int!) {
       metaobjects(type: $type, first: $first) {
         edges {
           node {
             id
             handle
-            type
             fields { key value }
           }
         }
       }
-    }
-  `;
+    }`;
 
-  const resp = await adminGraphQL<MetaobjectsResponse>(q, {
-    type: typeHandle,
-    first: 50,
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "X-Shopify-Access-Token": token,
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+    },
+    body: JSON.stringify({ query, variables: { type: "event", first: 100 } }),
   });
 
-  const edges = resp.data?.metaobjects?.edges ?? [];
-  type EventItem = {
-    id: string;
-    title?: string;
-    dateISO?: string;
-    when?: Date | null;
-    url?: string;
-    location?: string;
-  };
+  if (!resp.ok) return null;
+  const data = await resp.json().catch(() => null) as any;
+  const edges = data?.data?.metaobjects?.edges ?? [];
+  if (!Array.isArray(edges) || edges.length === 0) return null;
 
-  const events: EventItem[] = edges.map(({ node }) => {
-    const map = new Map(node.fields.map((f) => [f.key, f.value]));
-    const dateISO = map.get(dateKey);
-    const when = parseDateMaybe(dateISO);
-    return {
-      id: node.id,
-      title: map.get(titleKey) ?? node.handle ?? "Événement",
-      dateISO,
-      when,
-      url: map.get(urlKey) ?? `https://${process.env.SHOPIFY_SHOP}${calendarPath}`,
-      location: map.get(locKey) ?? undefined,
-    };
-  });
-
+  // Convertit et filtre pour l’événement à venir le plus proche
   const now = new Date();
-  const upcoming = events
-    .filter((e) => e.when && e.when.getTime() >= now.getTime())
-    .sort((a, b) => (a.when!.getTime() - b.when!.getTime()));
+  const upcoming: Array<{ item: EventItem; sortKey: number }> = [];
 
-  const next = upcoming[0];
-  if (!next) return null;
+  for (const e of edges) {
+    const fields = e?.node?.fields as Array<{ key: string; value: string }>;
+    if (!Array.isArray(fields)) continue;
+    const it = parseEventFields(fields);
+    if (!it.start) continue;
+    const start = new Date(it.start);
+    if (Number.isNaN(+start)) continue;
+    if (start >= now) {
+      upcoming.push({ item: it, sortKey: +start });
+    }
+  }
 
-  const dateFmt = next.when!.toLocaleDateString("fr-CA", {
+  if (upcoming.length === 0) return null;
+  upcoming.sort((a, b) => a.sortKey - b.sortKey);
+  return upcoming[0].item;
+}
+
+function formatDateFR(iso?: string): string | undefined {
+  if (!iso) return;
+  const d = new Date(iso);
+  if (Number.isNaN(+d)) return;
+  return d.toLocaleDateString("fr-CA", {
+    weekday: "long",
     year: "numeric",
     month: "long",
     day: "numeric",
   });
-
-  const text = [
-    `Prochaine compétition : ${next.title ?? "À confirmer"}`,
-    `Date : ${dateFmt}${next.location ? ` – Lieu : ${next.location}` : ""}`,
-    `Inscription / infos : ${next.url}`,
-  ].join("\n");
-
-  return {
-    id: "shopify:next-event",
-    url: next.url ?? `https://${process.env.SHOPIFY_SHOP}${calendarPath}`,
-    title: next.title ?? "Prochaine compétition",
-    text,
-  };
 }
 
-/** (Optionnel) derniers articles de blog pour renforcer le contexte */
-async function fetchLatestArticlesChunk(): Promise<IndexChunk | null> {
-  if (!hasShopifyAdmin()) return null;
+function buildNextEventAnswerHTML(ev: EventItem): string {
+  const start = formatDateFR(ev.start);
+  const end = formatDateFR(ev.end);
+  const base = publicBase();
+  const cal = base ? `${base}/pages/calendrier` : "";
 
-  const q = `
-    query LatestArticles($first: Int!) {
-      articles(first: $first, sortKey: PUBLISHED_AT, reverse: true) {
-        edges {
-          node {
-            id
-            title
-            onlineStoreUrl
-            publishedAt
-            blog { handle }
-          }
-        }
-      }
-    }
-  `;
-  const resp = await adminGraphQL<ArticlesResponse>(q, { first: 5 });
-  const edges = resp.data?.articles?.edges ?? [];
-  if (edges.length === 0) return null;
-
-  const lines = edges.map(({ node }, i) => {
-    const d =
-      node.publishedAt &&
-      new Date(node.publishedAt).toLocaleDateString("fr-CA", {
-        year: "numeric",
-        month: "long",
-        day: "numeric",
-      });
-    const url = node.onlineStoreUrl ?? `https://${process.env.SHOPIFY_SHOP}/blogs/${node.blog.handle}/${node.title}`;
-    return `[#${i + 1}] ${node.title}${d ? ` (${d})` : ""}\n${url}`;
-  });
-
-  return {
-    id: "shopify:latest-articles",
-    url: `https://${process.env.SHOPIFY_SHOP}/blogs`,
-    title: "Derniers articles du blog",
-    text: lines.join("\n\n"),
-  };
+  const parts: string[] = [];
+  parts.push(`<strong>Prochaine compétition :</strong>`);
+  if (ev.title) parts.push(`<div>• ${ev.title}</div>`);
+  if (start && end) parts.push(`<div>• Dates : du ${start} au ${end}</div>`);
+  else if (start) parts.push(`<div>• Date : ${start}</div>`);
+  if (ev.location) parts.push(`<div>• Lieu : ${ev.location}</div>`);
+  if (ev.url) parts.push(`<div>• Inscriptions : <a href="${ev.url}" target="_blank" rel="noopener">${ev.url}</a></div>`);
+  if (cal) parts.push(`<div>• Calendrier : <a href="${cal}" target="_blank" rel="noopener">${cal}</a></div>`);
+  return parts.join("");
 }
 
-/* =========================
-   Utils détection d’intention
-========================= */
-
-function includesAny(haystack: string, needles: string[]): boolean {
-  const s = haystack.toLowerCase();
-  return needles.some((n) => s.includes(n));
+function looksLikeNextEventQuestion(q: string): boolean {
+  const s = q.toLowerCase();
+  return /(prochain(e)?|date).*(comp(é|e)tition|tournoi|év(é|e)nement)/i.test(s);
 }
 
 /* =========================
@@ -538,54 +486,29 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // 1) Charger l’index local
-    const index = await loadIndex();
+    // 1) Réponse TEMPS RÉEL pour "prochaine compétition"
+    if (looksLikeNextEventQuestion(q)) {
+      const ev = await fetchNextEvent();
+      if (ev) {
+        const html = buildNextEventAnswerHTML(ev);
+        return new NextResponse(JSON.stringify({ answer: html }), { status: 200, headers });
+      }
+      // si rien trouvé, on continue vers le RAG/LLM
+    }
 
-    // 2) Récup basique
+    // 2) RAG indexé
+    const index = await loadIndex();
     const retrieved = topK(index, q, 6);
 
-    // 3) Temps réel Shopify si pertinent (prochaine compétition / calendrier)
-    const needEvent =
-      includesAny(q, ["prochaine", "prochain", "date", "compétition", "tournoi", "événement", "event", "calendrier"]) ||
-      includesAny(q, ["next", "tournament", "competition", "event", "calendar"]);
-
-    if (needEvent) {
-      try {
-        const nextEvent = await fetchNextEventChunk();
-        if (nextEvent) {
-          retrieved.unshift({ chunk: nextEvent, score: 1e6 }); // booste fort le contexte
-        }
-      } catch (e) {
-        // On n’échoue pas la requête si Shopify n’est pas dispo
-        console.warn("[faq-ai] fetchNextEventChunk failed:", e);
-      }
-    }
-
-    // 4) (Optionnel) si l’utilisateur parle de blog/actu, injecter les derniers articles
-    const needBlog =
-      includesAny(q, ["blog", "article", "actualité", "actualite", "news", "publication", "post"]);
-
-    if (needBlog) {
-      try {
-        const blogChunk = await fetchLatestArticlesChunk();
-        if (blogChunk) {
-          retrieved.push({ chunk: blogChunk, score: 1e5 });
-        }
-      } catch (e) {
-        console.warn("[faq-ai] fetchLatestArticlesChunk failed:", e);
-      }
-    }
-
-    // 5) Construire le prompt
     const sys = systemPrompt(process.env.RAG_SITE_NAME);
     const user = buildUserPrompt(q, lang, retrieved);
 
-    // 6) Appel modèle
     const apiKey = process.env.OPENROUTER_API_KEY ?? "";
     if (!apiKey) {
       return new NextResponse(
         JSON.stringify({
-          error: "OPENROUTER_API_KEY manquant. Ajoutez-le aux variables d’environnement du projet Vercel.",
+          error:
+            "OPENROUTER_API_KEY manquant. Ajoutez-le aux variables d’environnement du projet Vercel.",
         }),
         { status: 500, headers }
       );
@@ -593,8 +516,18 @@ export async function POST(req: NextRequest) {
 
     const { answer } = await answerWithFallback(apiKey, sys, user);
 
-    // 7) Retour
-    return new NextResponse(JSON.stringify({ answer }), { status: 200, headers });
+    // 3) Post-traitement : corriger host (enlever www) + liens cliquables
+    const base = publicBase();
+    const sanitized = answer
+      .replace(/https?:\/\/www\./gi, "https://") // retire www.
+      .replace(/https?:\/\/[^)\s]+myshopify\.com/gi, (m) => {
+        // force le host vers SHOPIFY_PUBLIC_BASE si dispo
+        return base ? base : m.replace(/\/+$/, "");
+      });
+
+    const htmlOut = autoLinkMarkdown(sanitized);
+
+    return new NextResponse(JSON.stringify({ answer: htmlOut }), { status: 200, headers });
   } catch (e: unknown) {
     console.error("[faq-ai] error:", e);
     const message = e instanceof Error ? e.message : "Unknown error";
