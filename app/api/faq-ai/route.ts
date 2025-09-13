@@ -17,7 +17,7 @@ type IndexChunk = {
   id: string;
   url: string;
   title?: string;
-  text: string; // contenu brut du chunk
+  text: string;
   tokens?: number;
 };
 
@@ -144,7 +144,7 @@ function buildIdfMap(chunks: IndexChunk[]): Map<string, number> {
   }
   const idf = new Map<string, number>();
   df.forEach((v, k) => {
-    idf.set(k, Math.log((1 + N) / (1 + v)) + 1); // IDF lissé
+    idf.set(k, Math.log((1 + N) / (1 + v)) + 1);
   });
   return idf;
 }
@@ -304,18 +304,189 @@ async function answerWithFallback(
     try {
       const ans = await callOpenRouterChat(apiKey, m, system, user);
       return { answer: ans, modelUsed: m };
-    } catch (err) {
+    } catch {
       tried.push(m);
-      // Essayer le suivant
     }
   }
-  // Dernière tentative avec DEFAULT_MODEL (au cas où la liste serait vide/incorrecte)
   const lastModel = DEFAULT_MODEL;
   if (!tried.includes(lastModel)) {
     const ans = await callOpenRouterChat(apiKey, lastModel, system, user);
     return { answer: ans, modelUsed: lastModel };
   }
   throw new Error(`Tous les modèles ont échoué: ${tried.join(", ")}`);
+}
+
+/* ========= Temps réel Shopify : prochaine compétition ========= */
+
+type ShopifyField = { key: string; value: string | null };
+type ShopifyMetaNode = {
+  id: string;
+  handle: string;
+  type: string;
+  updatedAt: string;
+  fields: ShopifyField[];
+};
+
+type NextEvent = {
+  id: string;
+  title: string;
+  dateISO: string;
+  location?: string;
+  link?: string;
+  source?: string;
+};
+
+const SHOPIFY_SHOP = process.env.SHOPIFY_SHOP ?? "";
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN ?? "";
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION ?? "2024-07";
+const SHOPIFY_PUBLIC_BASE = (process.env.SHOPIFY_PUBLIC_BASE ?? "").replace(/\/+$/, "");
+const SHOPIFY_META_TYPES = (process.env.SHOPIFY_METAOBJECT_TYPES ?? "event,competition")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const SHOPIFY_CALENDAR_URL = process.env.SHOPIFY_CALENDAR_URL ?? "";
+const SHOPIFY_GQL_URL = SHOPIFY_SHOP
+  ? `https://${SHOPIFY_SHOP}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`
+  : "";
+
+async function shopifyAdminGQL<T extends Record<string, unknown>>(
+  query: string,
+  variables?: Record<string, unknown>
+): Promise<T> {
+  if (!SHOPIFY_SHOP || !SHOPIFY_ADMIN_TOKEN) {
+    throw new Error("SHOPIFY_SHOP ou SHOPIFY_ADMIN_TOKEN manquant.");
+  }
+  const res = await fetch(SHOPIFY_GQL_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+    },
+    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+    // @ts-expect-error Next runtime accepte 'no-store' côté serveur
+    cache: "no-store",
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = (await res.json()) as { data?: T; errors?: unknown };
+  if (!res.ok || json.errors) {
+    throw new Error(`Shopify GraphQL error ${res.status}: ${JSON.stringify(json.errors ?? json)}`);
+  }
+  if (!json.data) throw new Error("Réponse Shopify vide.");
+  return json.data;
+}
+
+function extractEventLike(fields: ShopifyField[]) {
+  const byKey = new Map<string, string>();
+  for (const f of fields) if (f.value) byKey.set(f.key.toLowerCase(), f.value);
+
+  const pick = (candidates: string[]): string | undefined => {
+    for (const k of candidates) {
+      const v = byKey.get(k);
+      if (v && String(v).trim()) return String(v);
+    }
+    const rx = new RegExp(candidates.join("|"), "i");
+    for (const [k, v] of byKey) if (rx.test(k) && v.trim()) return v.trim();
+    return undefined;
+  };
+
+  const title = pick(["title", "name", "nom", "titre"]) ?? "Compétition";
+  const dateRaw = pick(["date", "start_date", "start", "when", "date_time", "datetime"]);
+  const location = pick(["location", "lieu", "city", "place", "ville"]);
+  const link = pick(["url", "link", "registration", "inscription"]);
+
+  return { title, dateRaw, location, link };
+}
+
+function toISO(s?: string): string | null {
+  if (!s) return null;
+  const d1 = new Date(s);
+  if (!Number.isNaN(d1.getTime())) return d1.toISOString();
+  const m = s.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  if (m) {
+    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).toISOString();
+  }
+  return null;
+}
+
+function formatFR(iso: string): string {
+  try {
+    return new Intl.DateTimeFormat("fr-FR", {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      timeZone: "UTC",
+    }).format(new Date(iso));
+  } catch {
+    return iso;
+  }
+}
+
+async function fetchNextEvent(): Promise<NextEvent | null> {
+  if (!SHOPIFY_META_TYPES.length) return null;
+
+  const q = `
+    query Meta($type: String!, $cursor: String) {
+      metaobjects(type: $type, first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id handle type updatedAt
+          fields { key value }
+        }
+      }
+    }
+  `;
+
+  const now = Date.now();
+  let best:
+    | { iso: string; node: ShopifyMetaNode; meta: ReturnType<typeof extractEventLike> }
+    | null = null;
+
+  for (const type of SHOPIFY_META_TYPES) {
+    let cursor: string | null = null;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const data = await shopifyAdminGQL<{
+        metaobjects: {
+          pageInfo: { hasNextPage: boolean; endCursor: string | null };
+          nodes: ShopifyMetaNode[];
+        };
+      }>(q, { type, cursor });
+
+      const { nodes, pageInfo } = data.metaobjects;
+
+      for (const n of nodes) {
+        const meta = extractEventLike(n.fields);
+        const iso = toISO(meta.dateRaw);
+        if (!iso) continue;
+        const ts = new Date(iso).getTime();
+        if (Number.isNaN(ts) || ts < now) continue;
+        if (!best || ts < new Date(best.iso).getTime()) {
+          best = { iso, node: n, meta };
+        }
+      }
+
+      if (!pageInfo.hasNextPage) break;
+      cursor = pageInfo.endCursor;
+      await new Promise((r) => setTimeout(r, 120));
+    }
+  }
+
+  if (!best) return null;
+
+  const publicSource =
+    best.meta.link ||
+    SHOPIFY_CALENDAR_URL ||
+    (SHOPIFY_PUBLIC_BASE ? `${SHOPIFY_PUBLIC_BASE}/pages/calendrier` : "");
+
+  return {
+    id: best.node.id,
+    title: best.meta.title,
+    dateISO: best.iso,
+    location: best.meta.location,
+    link: best.meta.link || undefined,
+    source: publicSource || undefined,
+  };
 }
 
 /* =========================
@@ -335,7 +506,44 @@ export async function POST(req: NextRequest) {
     }
 
     const index = await loadIndex();
-    const retrieved = topK(index, q, 6);
+
+    // Détection d’intention “prochaine compétition / date tournoi…”
+    const wantsNext =
+      /prochain|prochaine|next|bient[oô]t|date|quand/i.test(q) &&
+      /(comp[ée]tition|tournoi|event|év[ée]nement)/i.test(q);
+
+    let retrieved = topK(index, q, 6);
+
+    // Chunk “temps réel” Shopify si pertinent
+    if (wantsNext) {
+      try {
+        const ev = await fetchNextEvent();
+        if (ev) {
+          const prettyDate = formatFR(ev.dateISO);
+          const lines = [
+            `Prochaine compétition (temps réel Shopify)`,
+            `Titre : ${ev.title}`,
+            `Date : ${prettyDate}`,
+            ev.location ? `Lieu : ${ev.location}` : ``,
+            ev.link ? `Inscription : ${ev.link}` : ``,
+            ev.source ? `Source : ${ev.source}` : ``,
+          ]
+            .filter(Boolean)
+            .join("\n");
+
+          const realtimeChunk: IndexChunk = {
+            id: `realtime_event_${ev.id}`,
+            url: ev.link || ev.source || SHOPIFY_PUBLIC_BASE || "",
+            title: `Prochaine compétition : ${ev.title}`,
+            text: lines,
+          };
+
+          retrieved = [{ chunk: realtimeChunk, score: 1e9 }, ...retrieved];
+        }
+      } catch {
+        // silencieux : on retombe sur RAG normal
+      }
+    }
 
     const sys = systemPrompt(process.env.RAG_SITE_NAME);
     const user = buildUserPrompt(q, lang, retrieved);
@@ -352,11 +560,8 @@ export async function POST(req: NextRequest) {
     }
 
     const { answer } = await answerWithFallback(apiKey, sys, user);
-
-    // Pas de mention de langue visible : c’est géré par les consignes.
     return new NextResponse(JSON.stringify({ answer }), { status: 200, headers });
   } catch (e: unknown) {
-    // Log serveur pour debug
     console.error("[faq-ai] error:", e);
     const message = e instanceof Error ? e.message : "Unknown error";
     return new NextResponse(JSON.stringify({ error: message }), { status: 500, headers });
