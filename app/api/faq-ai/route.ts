@@ -68,39 +68,29 @@ async function loadIndex(): Promise<IndexFile> {
   const indexPath = path.join(root, "ingested", "index.json");
   const ingestedDir = path.join(root, "ingested");
 
-  // 1) Essayer index.json (supporte 'chunks' OU 'entries')
+  // 1) Essayer index.json
   try {
     const buf = await fs.readFile(indexPath, "utf8");
     const parsed = JSON.parse(buf) as unknown;
 
-    if (parsed && typeof parsed === "object") {
-      const p = parsed as { chunks?: unknown; entries?: unknown };
-      const fromChunks = Array.isArray(p.chunks) ? (p.chunks as unknown[]) : null;
-      const fromEntries = Array.isArray(p.entries) ? (p.entries as unknown[]) : null;
-      const arr: unknown[] = fromChunks ?? fromEntries ?? [];
-
-      if (arr.length > 0) {
-        const chunks = arr.map((c, i) => {
-          const obj = (c ?? {}) as Record<string, unknown>;
-          const text =
-            typeof obj.text === "string"
-              ? obj.text
-              : typeof obj.content === "string"
-              ? (obj.content as string)
-              : typeof obj.body === "string"
-              ? (obj.body as string)
-              : "";
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      "chunks" in (parsed as Record<string, unknown>) &&
+      Array.isArray((parsed as Record<string, unknown>).chunks)
+    ) {
+      const chunks = (parsed as { chunks: unknown[] }).chunks.map((c, i) => {
+        const obj = c as Record<string, unknown>;
         return {
-            id: String(obj.id ?? i.toString()),
-            url: String(obj.url ?? ""),
-            title: typeof obj.title === "string" ? (obj.title as string) : undefined,
-            text,
-            tokens: typeof obj.tokens === "number" ? (obj.tokens as number) : undefined,
-          } satisfies IndexChunk;
-        });
-        cachedIndex = { chunks };
-        return cachedIndex;
-      }
+          id: String(obj.id ?? i.toString()),
+          url: String(obj.url ?? ""),
+          title: obj.title ? String(obj.title) : undefined,
+          text: String(obj.text ?? (obj as Record<string, unknown>).content ?? ""),
+          tokens: typeof obj.tokens === "number" ? obj.tokens : undefined,
+        } satisfies IndexChunk;
+      });
+      cachedIndex = { chunks };
+      return cachedIndex;
     }
   } catch {
     // ignore
@@ -365,7 +355,7 @@ async function loadResultsChunks(): Promise<IndexChunk[]> {
 }
 
 /* =========================
-   Prompt & appel OpenRouter
+   Modèles OpenRouter (fallback)
 ========================= */
 
 const DEFAULT_MODEL_LIST =
@@ -383,6 +373,10 @@ const MODEL_LIST: string[] = process.env.RAG_MODEL
   : parseModelList(DEFAULT_MODEL_LIST);
 
 const DEFAULT_MODEL: string = MODEL_LIST[0] ?? "google/gemma-2-9b-it:free";
+
+/* =========================
+   Ton & règles (TON systemPrompt RESTE TEL QUEL)
+========================= */
 
 function systemPrompt(siteName: string | undefined): string {
   const tag = siteName ? ` pour ${siteName}` : "";
@@ -408,6 +402,10 @@ function systemPrompt(siteName: string | undefined): string {
     `Termine par une section "Sources" listant 1–3 liens du contexte (aucun autre lien). S’il n’y en a pas : « (Aucune source disponible) ».`,
   ].join("\n");
 }
+
+/* =========================
+   Build user prompt
+========================= */
 
 function buildUserPrompt(
   q: string,
@@ -441,6 +439,10 @@ function buildUserPrompt(
     `- Termine par une section "Sources" (1–3 liens) en Markdown [texte](url), sans afficher l’URL brute.`,
   ].join("\n");
 }
+
+/* =========================
+   OpenRouter
+========================= */
 
 async function callOpenRouterChat(
   apiKey: string,
@@ -534,10 +536,107 @@ function tidyLinks(markdown: string): string {
   // 3) Sur les liens déjà corrects, normalise juste le href (sans www)
   txt = txt.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g,
-    (_m, label: string, href: string) => `[${label}](${normalizeUrl(href)})`
+    (_m, label: string, href: string) => `[${label} ](${normalizeUrl(href)})`
   );
 
   return txt;
+}
+
+/* =========================
+   Humour & accroches (variation)
+========================= */
+
+function norm(s: string): string {
+  return s.toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+}
+
+function chance(p: number): boolean {
+  return Math.random() < p;
+}
+
+function pick<T>(arr: readonly T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+const GREETINGS: readonly string[] = [
+  "Osu ! Sempaï à l’écoute 🥋",
+  "Salut, jeune padawan du dojo !",
+  "Hey ! Besoin d’un coup de main façon karaté ?",
+  "Prêt·e ? On s’échauffe et on y va.",
+  "Bonjour ! J’ai déjà fait mes kata, et toi ?",
+  "Yo ! Le tatami est à toi.",
+  "Bienvenue au dojo Kinko !",
+  "On respire… et on pose sa question 😄",
+  "Salut ! Tu peux m’appeler **Sempaï** (je ne mords pas).",
+  "Kon’nichiwa ! Je t’écoute.",
+];
+
+const REMINDERS_SEMPAI: readonly string[] = [
+  "Petit rappel : on dit **Sempaï** 😉",
+  "Au dojo, on salue **Sempaï** d’abord !",
+  "Pour la forme : **Sempaï** s’il te plaît 😇",
+  "On m’appelle **Sempaï**… sinon petite série de renforcement 👀",
+  "Respect du dojo : **Sempaï** et c’est parti !",
+];
+
+const CONSEQUENCES: readonly string[] = [
+  "10 push-ups",
+  "15 sit-ups",
+  "20 squats",
+  "15 jumping jacks",
+  "10 burpees",
+  "20 fentes",
+  "30 s de planche",
+  "30 s de wall-sit",
+  "2 répétitions de ton kata préféré",
+  "10 mae-geri (contrôle 😉)",
+];
+
+const RUDE_HOOKS: readonly RegExp[] = [
+  /\b(ferme[- ]?la|tais[- ]?toi|ta gueule)\b/i,
+  /\b(con|idiot|imb[ée]cile)\b/i,
+  /\b(merde|putain)\b/i,
+];
+
+function isGreeting(q: string): boolean {
+  const m = norm(q);
+  return /^(salut|bonjour|bonsoir|yo|allo|hello|coucou)\b/.test(m);
+}
+
+function mentionsSempai(q: string): boolean {
+  const m = norm(q);
+  return /\bsempai\b/.test(m);
+}
+
+function soundsRude(q: string): boolean {
+  return RUDE_HOOKS.some((re) => re.test(q));
+}
+
+function humorPrefixFor(q: string): string {
+  const parts: string[] = [];
+
+  // Accroche variée si salutation
+  if (isGreeting(q) && chance(0.9)) {
+    parts.push(pick(GREETINGS));
+  }
+
+  // Doux rappel “Sempaï” (aléatoire, non bloquant)
+  if (!mentionsSempai(q) && chance(0.35)) {
+    const r = pick(REMINDERS_SEMPAI);
+    // Parfois jette un petit défi pour la blague
+    if (chance(0.4)) {
+      parts.push(`${r} (sinon ${pick(CONSEQUENCES)} !)`);
+    } else {
+      parts.push(r);
+    }
+  }
+
+  // Ton rude → humour + défi léger
+  if (soundsRude(q)) {
+    parts.push(`Hé, respect au dojo 🙃 Petit défi pour se recentrer : ${pick(CONSEQUENCES)} !`);
+  }
+
+  return parts.join("\n\n");
 }
 
 /* =========================
@@ -617,7 +716,11 @@ export async function POST(req: NextRequest) {
     const { answer } = await answerWithFallback(apiKey, sys, user);
     const pretty = tidyLinks(answer);
 
-    return new NextResponse(JSON.stringify({ answer: pretty }), { status: 200, headers });
+    // 5) Couche humour/accroche non bloquante (variée)
+    const prefix = humorPrefixFor(q);
+    const finalAnswer = prefix ? `${prefix}\n\n${pretty}` : pretty;
+
+    return new NextResponse(JSON.stringify({ answer: finalAnswer }), { status: 200, headers });
   } catch (e: unknown) {
     console.error("[faq-ai] error:", e);
     const message = e instanceof Error ? e.message : "Unknown error";
