@@ -81,12 +81,19 @@ async function loadIndex(): Promise<IndexFile> {
     ) {
       const chunks = (parsed as { chunks: unknown[] }).chunks.map((c, i) => {
         const obj = c as Record<string, unknown>;
+        const o = obj as { id?: unknown; url?: unknown; title?: unknown; text?: unknown; content?: unknown; tokens?: unknown };
+        const text =
+          typeof o.text === "string"
+            ? o.text
+            : typeof o.content === "string"
+            ? o.content
+            : "";
         return {
-          id: String(obj.id ?? i.toString()),
-          url: String(obj.url ?? ""),
-          title: obj.title ? String(obj.title) : undefined,
-          text: String(obj.text ?? (obj as Record<string, unknown>).content ?? ""),
-          tokens: typeof obj.tokens === "number" ? obj.tokens : undefined,
+          id: String(o.id ?? i.toString()),
+          url: String(o.url ?? ""),
+          title: typeof o.title === "string" ? o.title : undefined,
+          text,
+          tokens: typeof o.tokens === "number" ? o.tokens : undefined,
         } satisfies IndexChunk;
       });
       cachedIndex = { chunks };
@@ -320,7 +327,8 @@ async function loadResultsChunks(): Promise<IndexChunk[]> {
       const raw = await fs.readFile(full, "utf8");
       // Résumé "safe" pour retrieval
       let title = f.replace(/\.json$/i, "");
-      const url = `${process.env.SHOPIFY_PUBLIC_BASE ?? "https://qfxdmn-i3.myshopify.com"}/results/${encodeURIComponent(f)}`;
+      const base = process.env.SHOPIFY_PUBLIC_BASE ?? "https://qfxdmn-i3.myshopify.com";
+      const url = `${base.replace(/\/+$/,"")}/results/${encodeURIComponent(f)}`;
       let summary = raw.slice(0, 2000);
       try {
         const parsed = JSON.parse(raw) as Record<string, unknown>;
@@ -435,8 +443,10 @@ function buildUserPrompt(
     ``,
     `Consignes de réponse :`,
     `- Réponds directement, sans méta-commentaires.`,
+    `- Si tu fais un clin d’œil “Sempaï”, évite « au dojo ». Fais-le en **une seule phrase**, et propose **une seule** conséquence amusante au choix (10 push-ups OU 15 sit-ups OU 15 jumping jacks OU 20 fentes, etc.).`,
+    `- Pour les liens, utilise **Markdown** avec **le titre de la page** : [Titre de la page](url). N’affiche jamais l’URL brute.`,
     `- Si l'info n'est pas dans le contexte, dis-le et propose une alternative concrète (page à visiter, contact…).`,
-    `- Termine par une section "Sources" (1–3 liens) en Markdown [texte](url), sans afficher l’URL brute.`,
+    `- Termine par une section "Sources" (1–3 liens) en Markdown [Titre](url), sans afficher l’URL brute.`,
   ].join("\n");
 }
 
@@ -505,67 +515,99 @@ async function answerWithFallback(
 }
 
 /* =========================
-   Post-traitement de liens
+   Liens: titre uniquement (jamais l'URL visible)
 ========================= */
 
-function labelForUrl(u: string): string {
+// Titre deviné si le chunk n’en fournit pas
+function guessTitleFromUrl(u: string): string {
   try {
     const x = new URL(u);
-    const p = x.pathname;
-    if (p.includes("/pages/calendrier")) return "Calendrier des compétitions";
-    if (p.includes("/blogs/")) return "Article du blog";
-    if (p.includes("/products/")) return "Voir le produit";
-    if (p.includes("/pages/")) return "Voir la page";
-    return x.hostname.replace(/^www\./, "");
+    const path = x.pathname.replace(/\/+$/, "");
+    if (!path || path === "/") {
+      return x.hostname.replace(/^www\./, "");
+    }
+    const parts = path.split("/").filter(Boolean);
+    const last = decodeURIComponent(parts[parts.length - 1] || "");
+    const human = (s: string) =>
+      s.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+    if (path.includes("/pages/calendrier")) return "Calendrier des compétitions";
+    if (path.includes("/blogs/")) return "Article du blog";
+    if (path.includes("/products/")) return "Fiche produit";
+    if (path.includes("/pages/")) return human(last || "Page");
+
+    return human(last || x.hostname.replace(/^www\./, ""));
   } catch {
     return "Lien";
   }
 }
 
-function tidyLinks(markdown: string): string {
-  // 1) supprime www. dans les href
+function buildUrlTitleMap(items: Retrieved[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const it of items) {
+    const href = normalizeUrl(it.chunk.url || "");
+    if (!href) continue;
+    const title = (it.chunk.title || "").trim();
+    const best = title && !/^https?:\/\//i.test(title) ? title : guessTitleFromUrl(href);
+    if (best) map.set(href, best);
+  }
+  return map;
+}
+
+// Réécrit pour n’afficher que [Titre](url) (pas d’URL brute ni doublon à côté)
+function tidyLinks(markdown: string, titleMap: Map<string, string>): string {
+  // 1) normalise les href (supprime www.)
   let txt = markdown.replace(/\((https?:\/\/)www\./g, "($1");
 
-  // 2) Si le texte du lien est l’URL brute, remplace par un libellé
-  //    pattern: [https://domaine/...](https://domaine/...)
-  txt = txt.replace(
-    /\[https?:\/\/[^\]]+\]\((https?:\/\/[^\)]+)\)/g,
-    (_m, href: string) => `[${labelForUrl(href)}](${normalizeUrl(href)})`
-  );
+  // 2) Force un libellé "titre" sur tous les liens Markdown
+  txt = txt.replace(/\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g, (_m, _label: string, href: string) => {
+    const norm = normalizeUrl(href);
+    const best = titleMap.get(norm) ?? guessTitleFromUrl(norm);
+    return `[${best}](${norm})`;
+  });
 
-  // 3) Sur les liens déjà corrects, normalise juste le href (sans www)
+  // 3) Convertit les URLs brutes en lien Markdown avec titre (aucune URL visible)
+  txt = txt.replace(/(?<!\]\()https?:\/\/[^\s<)]+/g, (raw) => {
+    const norm = normalizeUrl(raw);
+    const best = titleMap.get(norm) ?? guessTitleFromUrl(norm);
+    return `[${best}](${norm})`;
+  });
+
+  // 4) Supprime une éventuelle répétition de l’URL juste après le lien
   txt = txt.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g,
-    (_m, label: string, href: string) => `[${label} ](${normalizeUrl(href)})`
+    /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)\s*(?:[\-–:]\s*)?\(?(https?:\/\/[^\s\)]+)\)?/g,
+    (m, label: string, u1: string, u2: string) => {
+      const a = normalizeUrl(u1);
+      const b = normalizeUrl(u2);
+      return a === b ? `[${label}](${a})` : m;
+    }
   );
 
   return txt;
 }
 
 /* =========================
-   Humour & accroches (variation)
+   Humour & accroches (variation, sans “au dojo”, 1 seule conséquence)
 ========================= */
 
 function norm(s: string): string {
   return s.toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
 }
-
 function chance(p: number): boolean {
   return Math.random() < p;
 }
-
 function pick<T>(arr: readonly T[]): T {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
 const GREETINGS: readonly string[] = [
   "Osu ! Sempaï à l’écoute 🥋",
-  "Salut, jeune padawan du dojo !",
+  "Salut, jeune padawan des tatamis !",
   "Hey ! Besoin d’un coup de main façon karaté ?",
   "Prêt·e ? On s’échauffe et on y va.",
   "Bonjour ! J’ai déjà fait mes kata, et toi ?",
-  "Yo ! Le tatami est à toi.",
-  "Bienvenue au dojo Kinko !",
+  "Yo ! C’est l’heure de briller.",
+  "Bienvenue chez Kinko !",
   "On respire… et on pose sa question 😄",
   "Salut ! Tu peux m’appeler **Sempaï** (je ne mords pas).",
   "Kon’nichiwa ! Je t’écoute.",
@@ -573,19 +615,19 @@ const GREETINGS: readonly string[] = [
 
 const REMINDERS_SEMPAI: readonly string[] = [
   "Petit rappel : on dit **Sempaï** 😉",
-  "Au dojo, on salue **Sempaï** d’abord !",
-  "Pour la forme : **Sempaï** s’il te plaît 😇",
-  "On m’appelle **Sempaï**… sinon petite série de renforcement 👀",
-  "Respect du dojo : **Sempaï** et c’est parti !",
+  "Par respect pour le titre : **Sempaï**, s’il te plaît 😇",
+  "Pour la forme : **Sempaï**, et c’est parti !",
+  "On m’appelle **Sempaï**… les titres, ça se mérite 👀",
+  "Un petit **Sempaï** et je te réponds au top !",
 ];
 
 const CONSEQUENCES: readonly string[] = [
   "10 push-ups",
   "15 sit-ups",
-  "20 squats",
   "15 jumping jacks",
-  "10 burpees",
   "20 fentes",
+  "20 squats",
+  "10 burpees",
   "30 s de planche",
   "30 s de wall-sit",
   "2 répétitions de ton kata préféré",
@@ -602,18 +644,17 @@ function isGreeting(q: string): boolean {
   const m = norm(q);
   return /^(salut|bonjour|bonsoir|yo|allo|hello|coucou)\b/.test(m);
 }
-
 function mentionsSempai(q: string): boolean {
   const m = norm(q);
   return /\bsempai\b/.test(m);
 }
-
 function soundsRude(q: string): boolean {
   return RUDE_HOOKS.some((re) => re.test(q));
 }
 
 function humorPrefixFor(q: string): string {
   const parts: string[] = [];
+  let usedChallenge = false;
 
   // Accroche variée si salutation
   if (isGreeting(q) && chance(0.9)) {
@@ -623,17 +664,22 @@ function humorPrefixFor(q: string): string {
   // Doux rappel “Sempaï” (aléatoire, non bloquant)
   if (!mentionsSempai(q) && chance(0.35)) {
     const r = pick(REMINDERS_SEMPAI);
-    // Parfois jette un petit défi pour la blague
-    if (chance(0.4)) {
+    if (!usedChallenge && chance(0.4)) {
       parts.push(`${r} (sinon ${pick(CONSEQUENCES)} !)`);
+      usedChallenge = true;
     } else {
       parts.push(r);
     }
   }
 
-  // Ton rude → humour + défi léger
+  // Ton rude → trait d’humour + au plus une conséquence
   if (soundsRude(q)) {
-    parts.push(`Hé, respect au dojo 🙃 Petit défi pour se recentrer : ${pick(CONSEQUENCES)} !`);
+    if (!usedChallenge) {
+      parts.push(`Hé, on se parle avec respect 🙃 Petit défi pour se recentrer : ${pick(CONSEQUENCES)} !`);
+      usedChallenge = true;
+    } else {
+      parts.push(`Hé, on se parle avec respect 🙃`);
+    }
   }
 
   return parts.join("\n\n");
@@ -714,9 +760,12 @@ export async function POST(req: NextRequest) {
     }
 
     const { answer } = await answerWithFallback(apiKey, sys, user);
-    const pretty = tidyLinks(answer);
 
-    // 5) Couche humour/accroche non bloquante (variée)
+    // Map URL -> Titre (depuis les morceaux utilisés) puis réécriture
+    const titleMap = buildUrlTitleMap(retrievedPlusPast);
+    const pretty = tidyLinks(answer, titleMap);
+
+    // Couche humour/accroche non bloquante (variée, max 1 conséquence)
     const prefix = humorPrefixFor(q);
     const finalAnswer = prefix ? `${prefix}\n\n${pretty}` : pretty;
 
