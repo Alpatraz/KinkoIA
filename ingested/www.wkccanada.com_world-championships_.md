@@ -1,6 +1,6 @@
 ---
 source_url: https://www.wkccanada.com/world-championships/
-fetched_at: 2025-09-14T14:25:22.209Z
+fetched_at: 2025-09-14T22:16:12.799Z
 chars: 4642
 via: html_fallback
 ---

@@ -1,6 +1,6 @@
 ---
 source_url: https://www.wkccanada.com/competition-rules/
-fetched_at: 2025-09-14T14:25:14.779Z
+fetched_at: 2025-09-14T22:16:09.592Z
 chars: 2034
 via: html_fallback
 ---

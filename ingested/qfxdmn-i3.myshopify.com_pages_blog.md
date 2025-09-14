@@ -1,6 +1,6 @@
 ---
 source_url: https://qfxdmn-i3.myshopify.com/pages/blog
-fetched_at: 2025-09-14T14:25:23.567Z
+fetched_at: 2025-09-14T22:16:14.385Z
 chars: 664
 via: html_fallback
 ---

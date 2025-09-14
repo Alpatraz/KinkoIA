@@ -1,6 +1,6 @@
 ---
 source_url: https://karatesunfuki.com/regles-du-dojo/
-fetched_at: 2025-09-14T14:25:14.427Z
+fetched_at: 2025-09-14T22:16:09.142Z
 chars: 4426
 via: html_fallback
 ---

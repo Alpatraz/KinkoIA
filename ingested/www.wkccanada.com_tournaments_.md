@@ -1,6 +1,6 @@
 ---
 source_url: https://www.wkccanada.com/tournaments/
-fetched_at: 2025-09-14T14:25:17.346Z
+fetched_at: 2025-09-14T22:16:12.641Z
 chars: 1621
 via: html_fallback
 ---

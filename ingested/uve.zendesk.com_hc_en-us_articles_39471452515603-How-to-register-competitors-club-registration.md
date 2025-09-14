@@ -1,6 +1,6 @@
 ---
 source_url: https://uve.zendesk.com/hc/en-us/articles/39471452515603-How-to-register-competitors-club-registration
-fetched_at: 2025-09-12T17:20:46.091Z
+fetched_at: 2025-09-14T22:16:09.844Z
 chars: 3053
 via: html_fallback
 ---

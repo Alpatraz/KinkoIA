@@ -1,6 +1,6 @@
 ---
 source_url: https://wakocanada.org/news-events/events/
-fetched_at: 2025-09-14T14:25:17.133Z
+fetched_at: 2025-09-14T22:16:12.397Z
 chars: 7402
 via: html_fallback
 ---
