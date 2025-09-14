@@ -1,224 +1,250 @@
-#!/usr/bin/env node
-/* Dump Shopify content to ./ingested as Markdown.
- * Reads .env.local for SHOPIFY_SHOP and SHOPIFY_ADMIN_TOKEN.
- * Works even when the storefront is password-protected (uses Admin API).
+/* scripts/shopify_dump.cjs
+ * Dump Shopify Pages, Blogs/Articles et Metaobjects vers ./ingested/*.md
+ * Utilise l'Admin GraphQL API.
  */
-
-"use strict";
-
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const { setTimeout: delay } = require("node:timers/promises");
 
-// Load env (prefer .env.local; fall back to default .env)
-const dotenv = require("dotenv");
-dotenv.config({ path: path.join(process.cwd(), ".env.local") });
-dotenv.config(); // fallback if some vars are only in .env
+// Charge .env.local si non préchargé par -r dotenv/config
+try { require("dotenv").config({ path: process.env.dotenv_config_path || ".env.local" }); } catch {}
 
-const SHOP = process.env.SHOPIFY_SHOP || process.env.SHOPIFY_STORE_DOMAIN;
+const SHOP = process.env.SHOPIFY_SHOP;
 const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-07";
-const OUT_DIR = path.join(process.cwd(), "ingested");
+const PUBLIC_BASE = (process.env.SHOPIFY_PUBLIC_BASE || "").replace(/\/+$/,"");
+const META_TYPES = (process.env.SHOPIFY_METAOBJECT_TYPES || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
+const CALENDAR_URL = process.env.SHOPIFY_CALENDAR_URL || "";
 
 if (!SHOP || !ADMIN_TOKEN) {
   console.error("❌ SHOPIFY_SHOP ou SHOPIFY_ADMIN_TOKEN manquant dans .env.local");
   process.exit(1);
 }
 
-const ADMIN_BASE = `https://${SHOP}/admin/api/${API_VERSION}`;
-const PUBLIC_BASE =
-  (process.env.SHOPIFY_PUBLIC_BASE && process.env.SHOPIFY_PUBLIC_BASE.replace(/\/+$/, "")) ||
-  `https://${SHOP}`;
+const GQL_URL = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
+const OUT_DIR = path.join(process.cwd(), "ingested");
 
-function adminHeaders() {
-  return {
-    "Content-Type": "application/json",
-    "X-Shopify-Access-Token": ADMIN_TOKEN,
-  };
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// Shopify "Link" header → page_info (for pagination)
-function nextPageInfoFromLink(linkHeader) {
-  if (!linkHeader) return null;
-  // Example: <https://shop/admin/api/2024-07/products.json?limit=250&page_info=XXXX>; rel="next"
-  const parts = linkHeader.split(",");
-  for (const p of parts) {
-    if (p.includes('rel="next"')) {
-      const m = p.match(/<([^>]+)>/);
-      if (!m) continue;
-      const url = new URL(m[1]);
-      return url.searchParams.get("page_info");
-    }
+async function adminGQL(query, variables) {
+  const res = await fetch(GQL_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": ADMIN_TOKEN,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = await res.json();
+  if (!res.ok || json.errors) {
+    throw new Error(`Shopify GraphQL error: ${res.status} ${JSON.stringify(json.errors || json)}`);
   }
-  return null;
+  return json.data;
 }
 
-async function adminGetAll(pathname, query = {}) {
-  const results = [];
-  let pageInfo = null;
-  do {
-    const url = new URL(ADMIN_BASE + pathname);
-    // default limit 250
-    url.searchParams.set("limit", String(query.limit ?? 250));
-    for (const [k, v] of Object.entries(query)) {
-      if (k !== "limit") url.searchParams.set(k, String(v));
-    }
-    if (pageInfo) url.searchParams.set("page_info", pageInfo);
-
-    const res = await fetch(url, { headers: adminHeaders() });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`GET ${pathname} ${res.status}: ${text}`);
-    }
-    const json = await res.json();
-
-    // top-level key depends on resource:
-    // pages: { pages: [...] }, blogs: { blogs: [...] }, articles: { articles: [...] }, etc.
-    const key = Object.keys(json).find((k) => Array.isArray(json[k]));
-    if (key) results.push(...json[key]);
-
-    pageInfo = nextPageInfoFromLink(res.headers.get("Link"));
-    // be nice to API
-    if (pageInfo) await sleep(200);
-  } while (pageInfo);
-
-  return results;
-}
-
-function sanitizeFileName(s) {
-  return s
+function slugify(s) {
+  return String(s || "")
     .toLowerCase()
-    .replace(/https?:\/\//g, "")
-    .replace(/[^a-z0-9._-]+/g, "_")
-    .replace(/^_+|_+$/g, "");
+    .normalize("NFKD")
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/(^-|-$)/g, "");
 }
 
-async function writeMarkdown({ url, title, body, kind, id }) {
-  const safe = sanitizeFileName(`${url || title || id || kind}.md`);
-  const file = path.join(OUT_DIR, safe);
-  const fm = [
-    "---",
-    `url: ${url || ""}`,
-    `title: "${(title || "").replace(/"/g, '\\"')}"`,
-    `kind: ${kind}`,
-    `source: shopify_admin`,
-    "---",
-    "",
-  ].join("\n");
-
-  const md = `${fm}${body || ""}\n`;
-  await fs.writeFile(file, md, "utf8");
-  return file;
+async function writeMD(name, lines) {
+  await fs.mkdir(OUT_DIR, { recursive: true });
+  const file = path.join(OUT_DIR, `${name}.md`);
+  await fs.writeFile(file, lines.join("\n"), "utf8");
+  console.log(`   ✔️  Saved: ${path.relative(process.cwd(), file)} (${(lines.join("\n").length)} chars)`);
 }
 
+/* --------------------
+   Dump Pages
+-------------------- */
 async function dumpPages() {
-  const pages = await adminGetAll("/pages.json");
-  const files = [];
-  for (const p of pages) {
-    const url = `${PUBLIC_BASE}/pages/${p.handle}`;
-    const body = (p.body_html || "")
-      .replace(/<\/?script[^>]*>/gi, "")
-      .replace(/\r/g, "");
-    files.push(
-      await writeMarkdown({
-        url,
-        title: p.title,
-        body,
-        kind: "page",
-        id: p.id,
-      })
-    );
-  }
-  console.log(` - pages: ${files.length} fichier(s)`);
-  return files;
-}
-
-async function dumpBlogsAndArticles() {
-  const blogs = await adminGetAll("/blogs.json");
+  console.log("⏳ Pages…");
+  const q = `
+    query Pages($cursor: String) {
+      pages(first: 100, after: $cursor, sortKey: UPDATED_AT) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id handle title bodyHtml updatedAt onlineStoreUrl }
+      }
+    }`;
+  let cursor = null;
   let count = 0;
-  for (const b of blogs) {
-    const blogBase = `${PUBLIC_BASE}/blogs/${b.handle}`;
-    const articles = await adminGetAll(`/blogs/${b.id}/articles.json`);
-    for (const a of articles) {
-      const url = `${blogBase}/${a.handle}`;
-      const body = (a.body_html || "")
-        .replace(/<\/?script[^>]*>/gi, "")
-        .replace(/\r/g, "");
-      await writeMarkdown({
-        url,
-        title: a.title,
-        body,
-        kind: "article",
-        id: a.id,
-      });
+
+  while (true) {
+    const data = await adminGQL(q, { cursor });
+    const { nodes, pageInfo } = data.pages;
+    for (const p of nodes) {
+      const url = p.onlineStoreUrl || (PUBLIC_BASE ? `${PUBLIC_BASE}/pages/${p.handle}` : "");
+      const md = [
+        `# ${p.title || p.handle}`,
+        ``,
+        `Source: ${url}`,
+        `Updated: ${p.updatedAt}`,
+        ``,
+        // bodyHtml -> texte brut simple
+        String(p.bodyHtml || "")
+          .replace(/<br\s*\/?>/gi, "\n")
+          .replace(/<[^>]+>/g, "")
+      ];
+      await writeMD(`shopify_page_${p.handle}`, md);
       count++;
     }
+    if (!pageInfo.hasNextPage) break;
+    cursor = pageInfo.endCursor;
+    await delay(150); // respirer un peu
   }
-  console.log(` - articles: ${count} fichier(s)`);
+  console.log(`✅ Pages: ${count}`);
 }
 
-async function dumpProducts() {
-  const products = await adminGetAll("/products.json", { fields: "id,title,handle,body_html,tags,vendor" });
-  let count = 0;
-  for (const p of products) {
-    const url = `${PUBLIC_BASE}/products/${p.handle}`;
-    const body = [
-      `# ${p.title}\n`,
-      p.body_html || "",
-      "",
-      p.vendor ? `**Vendor:** ${p.vendor}` : "",
-      p.tags ? `**Tags:** ${p.tags}` : "",
-    ]
-      .filter(Boolean)
-      .join("\n");
-    await writeMarkdown({
-      url,
-      title: p.title,
-      body,
-      kind: "product",
-      id: p.id,
-    });
-    count++;
+/* --------------------
+   Dump Blogs + Articles
+-------------------- */
+async function dumpBlogs() {
+  console.log("⏳ Blogs & Articles…");
+  const qBlogs = `
+    query Blogs($cursor:String) {
+      blogs(first: 50, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id handle title }
+      }
+    }`;
+  const qArticles = `
+    query Articles($id:ID!, $cursor:String) {
+      blog(id:$id) {
+        articles(first: 100, after:$cursor, sortKey: UPDATED_AT) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            id handle title contentHtml excerpt tags publishedAt onlineStoreUrl
+          }
+        }
+      }
+    }`;
+
+  let cursor = null;
+  let total = 0;
+  while (true) {
+    const data = await adminGQL(qBlogs, { cursor });
+    const { nodes: blogs, pageInfo } = data.blogs;
+
+    for (const b of blogs) {
+      let ac = null;
+      while (true) {
+        const ad = await adminGQL(qArticles, { id: b.id, cursor: ac });
+        const art = ad.blog.articles;
+        for (const a of art.nodes) {
+          const url =
+            a.onlineStoreUrl || (PUBLIC_BASE ? `${PUBLIC_BASE}/blogs/${b.handle}/${a.handle}` : "");
+          const text = (a.contentHtml || a.excerpt || "")
+            .replace(/<br\s*\/?>/gi, "\n")
+            .replace(/<[^>]+>/g, "");
+          const md = [
+            `# ${a.title || a.handle}`,
+            ``,
+            `Blog: ${b.title} (${b.handle})`,
+            `Source: ${url}`,
+            `Published: ${a.publishedAt || ""}`,
+            `Tags: ${(a.tags || []).join(", ")}`,
+            ``,
+            text
+          ];
+          await writeMD(`shopify_blog_${b.handle}__${a.handle}`, md);
+          total++;
+        }
+        if (!art.pageInfo.hasNextPage) break;
+        ac = art.pageInfo.endCursor;
+        await delay(150);
+      }
+    }
+    if (!pageInfo.hasNextPage) break;
+    cursor = pageInfo.endCursor;
+    await delay(150);
   }
-  console.log(` - products: ${count} fichier(s)`);
+  console.log(`✅ Articles: ${total}`);
 }
 
-async function dumpCollections() {
-  const custom = await adminGetAll("/custom_collections.json");
-  const smart = await adminGetAll("/smart_collections.json");
-  const all = [...custom, ...smart];
-  let count = 0;
-  for (const c of all) {
-    const url = `${PUBLIC_BASE}/collections/${c.handle}`;
-    const body = [`# ${c.title}\n`, c.body_html || ""].join("\n");
-    await writeMarkdown({
-      url,
-      title: c.title,
-      body,
-      kind: "collection",
-      id: c.id,
-    });
-    count++;
+/* --------------------
+   Dump Metaobjects
+-------------------- */
+async function dumpMetaobjects() {
+  if (META_TYPES.length === 0) {
+    console.log("ℹ️  Aucun type dans SHOPIFY_METAOBJECT_TYPES — étape ignorée.");
+    return;
   }
-  console.log(` - collections: ${count} fichier(s)`);
+  console.log(`⏳ Metaobjects (${META_TYPES.join(", ")})…`);
+
+  const q = `
+    query Meta($type:String!, $cursor:String) {
+      metaobjects(type:$type, first:100, after:$cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id handle type updatedAt
+          fields { key value }
+        }
+      }
+    }`;
+
+  let total = 0;
+
+  for (const type of META_TYPES) {
+    let cursor = null;
+    while (true) {
+      const data = await adminGQL(q, { type, cursor });
+      const { nodes, pageInfo } = data.metaobjects;
+
+      for (const m of nodes) {
+        // Map fields -> objet clé/valeur
+        const fm = {};
+        for (const f of m.fields || []) fm[f.key] = f.value;
+
+        // Champs "classiques" si présents : title/name/date/location/url/description
+        const title = fm.title || fm.name || m.handle || `${m.type} ${m.id}`;
+        const date =
+          fm.date || fm.start_date || fm.start || fm.when || fm.date_time || "";
+        const location = fm.location || fm.city || fm.place || "";
+        const link = fm.url || fm.link || fm.registration || "";
+        const desc = fm.description || fm.note || fm.notes || "";
+
+        // Lien public de repli : page calendrier si fournie
+        const publicUrl = link || CALENDAR_URL || "";
+
+        // Construire un corps texte bien indexable
+        const lines = [
+          `# ${title}`,
+          ``,
+          `Type: ${m.type}`,
+          `Handle: ${m.handle}`,
+          `Updated: ${m.updatedAt}`,
+          publicUrl ? `Source: ${publicUrl}` : `Source: (metaobject ${m.type})`,
+          ``,
+          date ? `Date: ${date}` : ``,
+          location ? `Lieu: ${location}` : ``,
+          ``,
+          desc || ``,
+          ``,
+          `--- Champs complets ---`,
+          ...Object.entries(fm).map(([k, v]) => `- ${k}: ${v}`)
+        ].filter(Boolean);
+
+        await writeMD(`shopify_meta_${type}__${slugify(m.handle)}`, lines);
+        total++;
+      }
+
+      if (!pageInfo.hasNextPage) break;
+      cursor = pageInfo.endCursor;
+      await delay(150);
+    }
+  }
+  console.log(`✅ Metaobjects: ${total}`);
 }
 
-(async function main() {
-  console.log(`🔓 Shopify dump from ${SHOP} (${API_VERSION}) → ${OUT_DIR}`);
-  await fs.mkdir(OUT_DIR, { recursive: true });
-
-  try {
-    await dumpPages();
-    await dumpBlogsAndArticles();
-    await dumpProducts();
-    await dumpCollections();
-    console.log("✅ Terminé.");
-    process.exit(0);
-  } catch (err) {
-    console.error("❌ Échec:", err?.message || err);
-    process.exit(1);
-  }
+/* --------------------
+   main
+-------------------- */
+(async () => {
+  console.log("▶️  Shopify dump → ./ingested");
+  await dumpPages().catch(e => { console.error("Pages error:", e); });
+  await dumpBlogs().catch(e => { console.error("Blogs error:", e); });
+  await dumpMetaobjects().catch(e => { console.error("Metaobjects error:", e); });
+  console.log("✅ Terminé.");
 })();

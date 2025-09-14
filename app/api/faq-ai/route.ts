@@ -68,29 +68,39 @@ async function loadIndex(): Promise<IndexFile> {
   const indexPath = path.join(root, "ingested", "index.json");
   const ingestedDir = path.join(root, "ingested");
 
-  // 1) Essayer index.json
+  // 1) Essayer index.json (supporte 'chunks' OU 'entries')
   try {
     const buf = await fs.readFile(indexPath, "utf8");
     const parsed = JSON.parse(buf) as unknown;
 
-    if (
-      parsed &&
-      typeof parsed === "object" &&
-      "chunks" in (parsed as Record<string, unknown>) &&
-      Array.isArray((parsed as Record<string, unknown>).chunks)
-    ) {
-      const chunks = (parsed as { chunks: unknown[] }).chunks.map((c, i) => {
-        const obj = c as Record<string, unknown>;
+    if (parsed && typeof parsed === "object") {
+      const p = parsed as { chunks?: unknown; entries?: unknown };
+      const fromChunks = Array.isArray(p.chunks) ? (p.chunks as unknown[]) : null;
+      const fromEntries = Array.isArray(p.entries) ? (p.entries as unknown[]) : null;
+      const arr: unknown[] = fromChunks ?? fromEntries ?? [];
+
+      if (arr.length > 0) {
+        const chunks = arr.map((c, i) => {
+          const obj = (c ?? {}) as Record<string, unknown>;
+          const text =
+            typeof obj.text === "string"
+              ? obj.text
+              : typeof obj.content === "string"
+              ? (obj.content as string)
+              : typeof obj.body === "string"
+              ? (obj.body as string)
+              : "";
         return {
-          id: String(obj.id ?? i.toString()),
-          url: String(obj.url ?? ""),
-          title: obj.title ? String(obj.title) : undefined,
-          text: String(obj.text ?? (obj as Record<string, unknown>).content ?? ""),
-          tokens: typeof obj.tokens === "number" ? obj.tokens : undefined,
-        } satisfies IndexChunk;
-      });
-      cachedIndex = { chunks };
-      return cachedIndex;
+            id: String(obj.id ?? i.toString()),
+            url: String(obj.url ?? ""),
+            title: typeof obj.title === "string" ? (obj.title as string) : undefined,
+            text,
+            tokens: typeof obj.tokens === "number" ? (obj.tokens as number) : undefined,
+          } satisfies IndexChunk;
+        });
+        cachedIndex = { chunks };
+        return cachedIndex;
+      }
     }
   } catch {
     // ignore
@@ -524,7 +534,7 @@ function tidyLinks(markdown: string): string {
   // 3) Sur les liens déjà corrects, normalise juste le href (sans www)
   txt = txt.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\)]+)\)/g,
-    (_m, label: string, href: string) => `[${label} ](${normalizeUrl(href)})`
+    (_m, label: string, href: string) => `[${label}](${normalizeUrl(href)})`
   );
 
   return txt;
