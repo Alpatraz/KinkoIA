@@ -8,9 +8,23 @@
     "build": "next build --turbopack",
     "start": "next start",
     "lint": "eslint",
-    "ingest": "echo See README",
+
+    "ingest": "NODE_OPTIONS=\"--max-old-space-size=6144 --expose-gc\" node scripts/crawl_and_ingest_sources.cjs --html-cap 90000 --timeout 20000 --concurrency 1",
+    "reindex": "node scripts/build_index.cjs --ingested ./ingested --out ./ingested/index.json --chunk 900",
+    "rag:sync": "npm run ingest && npm run reindex",
+    "rag:status": "jq '.chunks | length' ingested/index.json || echo '(installe jq pour ce check)'",
+
+    "deploy": "git add sources.csv ingested/index.json && git commit -m \"feat(rag): refresh $(date -u +'%Y-%m-%d %H:%MZ')\" || echo 'nothing to commit' && git push origin main",
+    "deploy:full": "git add sources.csv ingested/index.json ingested/*.md && git commit -m \"feat(rag): refresh (+md) $(date -u +'%Y-%m-%d %H:%MZ')\" || echo 'nothing to commit' && git push origin main",
+
+    "rag:all": "npm run rag:sync && npm run rag:status && npm run deploy",
+
     "ingest:faq": "node scripts/ingest_faq_items.js",
-    "ingest:sources": "node --max-old-space-size=406144 scripts/crawl_and_ingest_sources.cjs"
+    "ingest:sources": "npm run ingest",
+
+    "shopify:events": "node scripts/pull_shopify_events.cjs",
+    "events:status": "node -e \"const fs=require('fs');try{const a=JSON.parse(fs.readFileSync('public/events.json','utf8'));console.log(Array.isArray(a)?a.length:0)}catch{console.log(0)}\"",
+    "rag:events:sync": "npm run shopify:events && git add public/events.json && git commit -m \"data(events): refresh $(date -u +'%Y-%m-%d %H:%MZ')\" || echo 'nothing to commit' && git push origin main"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.57.2",
